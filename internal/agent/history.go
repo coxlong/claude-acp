@@ -175,6 +175,9 @@ func scanSessionFile(path, wantCwd string) (acp.SessionInfo, bool) {
 }
 
 func (a *Agent) findSessionFile(id, cwd string) string {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\`) {
+		return ""
+	}
 	root := filepath.Join(a.configDir(), "projects")
 	dirs, err := os.ReadDir(root)
 	if err != nil {

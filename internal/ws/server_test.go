@@ -250,6 +250,27 @@ func TestDuplicateRequestIsReplayedNotReexecuted(t *testing.T) {
 	}
 }
 
+func TestMalformedFrameDoesNotKillClient(t *testing.T) {
+	ts, _ := newTestServer(t, "", 10*time.Second)
+	conn, _ := dial(t, ts, "", nil)
+	_ = readJSON(t, conn)
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":`)); err != nil {
+		t.Fatalf("write malformed frame: %v", err)
+	}
+
+	writeJSON(t, conn, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{"protocolVersion": 1},
+	})
+	resp := readJSON(t, conn)
+	if resp["result"] == nil {
+		t.Fatalf("client did not recover from malformed frame: %#v", resp)
+	}
+}
+
 func TestAuth(t *testing.T) {
 	ts, _ := newTestServer(t, "secret", 10*time.Second)
 

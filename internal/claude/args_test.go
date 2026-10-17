@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 )
@@ -30,6 +31,20 @@ func TestBuildArgsResume(t *testing.T) {
 	}
 	if slices.Contains(args, "--session-id=old") {
 		t.Fatalf("resume must not also pass --session-id: %v", args)
+	}
+}
+
+func TestResultMessageJSONTags(t *testing.T) {
+	raw := `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+		`"result":"boom","stop_reason":"max_tokens","terminal_reason":"max_turns",` +
+		`"session_id":"s1","num_turns":3}`
+	var msg ResultMessage
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !msg.IsError || msg.StopReason != "max_tokens" || msg.TerminalReason != "max_turns" ||
+		msg.SessionID != "s1" || msg.NumTurns != 3 || msg.Result != "boom" {
+		t.Fatalf("decoded = %#v", msg)
 	}
 }
 

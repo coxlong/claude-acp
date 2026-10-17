@@ -13,12 +13,17 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const writeTimeout = 30 * time.Second
+const (
+	writeTimeout = 30 * time.Second
+	pongWait     = 90 * time.Second
+	pingPeriod   = 30 * time.Second
+)
 
 type physical struct {
-	id   uint64
-	conn *websocket.Conn
-	done chan struct{}
+	id         uint64
+	conn       *websocket.Conn
+	done       chan struct{}
+	writerDone chan struct{}
 }
 
 // Slot is one logical ACP client. It owns the JSON-RPC connection, the
@@ -82,18 +87,25 @@ func (s *Slot) Handle(ctx context.Context, req *rpc.Request) (any, *rpc.Error) {
 	return s.handler.Handle(ctx, req)
 }
 
-// ReadObject implements rpc.ObjectStream.
+// ReadObject implements rpc.ObjectStream. Malformed frames are dropped: a
+// single bad frame must not tear down the logical client and its sessions.
 func (s *Slot) ReadObject(v any) error {
-	select {
-	case <-s.done:
-		return io.EOF
-	default:
-	}
-	select {
-	case <-s.done:
-		return io.EOF
-	case frame := <-s.inbound:
-		return json.Unmarshal(frame, v)
+	for {
+		select {
+		case <-s.done:
+			return io.EOF
+		default:
+		}
+		select {
+		case <-s.done:
+			return io.EOF
+		case frame := <-s.inbound:
+			if err := json.Unmarshal(frame, v); err != nil {
+				s.log.Warn("dropping malformed frame", "err", err)
+				continue
+			}
+			return nil
+		}
 	}
 }
 
@@ -155,6 +167,8 @@ func (s *Slot) isClosed() bool {
 
 // attach binds a physical connection and starts its writer pump.
 func (s *Slot) attach(conn *websocket.Conn, reconnect bool) *physical {
+	var old *physical
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -166,13 +180,23 @@ func (s *Slot) attach(conn *websocket.Conn, reconnect bool) *physical {
 		s.grace = nil
 	}
 	if s.phys != nil {
-		_ = s.phys.conn.Close()
-		close(s.phys.done)
+		old = s.phys
+		close(old.done)
 	}
 	s.gen++
-	p := &physical{id: s.gen, conn: conn, done: make(chan struct{})}
+	p := &physical{id: s.gen, conn: conn, done: make(chan struct{}), writerDone: make(chan struct{})}
 	s.phys = p
 	s.mu.Unlock()
+
+	// Let the previous writer finish before draining the shared outbox, so
+	// two pumps cannot race for the same frames.
+	if old != nil {
+		_ = old.conn.Close()
+		select {
+		case <-old.writerDone:
+		case <-time.After(2 * time.Second):
+		}
+	}
 
 	kind := "connected"
 	if reconnect {
@@ -183,6 +207,7 @@ func (s *Slot) attach(conn *websocket.Conn, reconnect bool) *physical {
 	_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := p.conn.WriteMessage(websocket.TextMessage, preamble); err != nil {
 		_ = p.conn.Close()
+		close(p.writerDone)
 		return p
 	}
 
@@ -195,11 +220,18 @@ func (s *Slot) readPump(p *physical) {
 	defer s.detach(p)
 
 	p.conn.SetReadLimit(s.srv.cfg.MaxFrameBytes)
+	_ = p.conn.SetReadDeadline(time.Now().Add(pongWait))
+	p.conn.SetPongHandler(func(string) error {
+		return p.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
 	for {
 		_, data, err := p.conn.ReadMessage()
 		if err != nil {
 			return
 		}
+		// Any inbound traffic (including the client's $/ping notifications)
+		// proves the peer is alive.
+		_ = p.conn.SetReadDeadline(time.Now().Add(pongWait))
 		for _, line := range splitLines(data) {
 			s.handleInboundLine(line)
 		}
@@ -207,17 +239,37 @@ func (s *Slot) readPump(p *physical) {
 }
 
 func (s *Slot) writePump(p *physical) {
+	defer close(p.writerDone)
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-p.done:
 			return
 		case <-s.done:
 			return
+		case <-ticker.C:
+			_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := p.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				_ = p.conn.Close()
+				return
+			}
 		case <-s.out.signal():
 		}
-		for _, frame := range s.out.drain() {
+
+		frames := s.out.drain()
+		for i, frame := range frames {
+			select {
+			case <-p.done:
+				s.out.requeue(frames[i:])
+				return
+			default:
+			}
 			_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if err := p.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				// Requeue undelivered frames for the next connection.
+				s.out.requeue(frames[i:])
 				_ = p.conn.Close()
 				return
 			}

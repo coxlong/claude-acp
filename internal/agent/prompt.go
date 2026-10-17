@@ -22,12 +22,13 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 		return acp.PromptResponse{}, rpc.ErrInvalidParams("prompt contains no text")
 	}
 
-	sess.promptMu.Lock()
+	if !sess.promptMu.TryLock() {
+		return acp.PromptResponse{}, rpc.ErrInvalidParams("session is busy")
+	}
 	defer sess.promptMu.Unlock()
 
-	sess.resetTurn()
-	sess.setTurnCtx(ctx)
-	defer sess.resetTurn()
+	sess.beginTurn(ctx)
+	defer sess.endTurn()
 
 	if err := sess.client.SendUserText(text); err != nil {
 		return acp.PromptResponse{}, rpc.ErrInternalMsg(err.Error())
@@ -50,8 +51,13 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 			// The turn was cancelled at the protocol level. Ask the CLI to
 			// stop, then drain the rest of the turn so the next prompt does
 			// not consume its messages.
+			sess.cancelPermission()
 			_ = sess.client.Interrupt(context.Background())
-			drainTurn(sess)
+			if !drainTurn(sess) {
+				// The CLI did not settle in time; kill it so stale events
+				// cannot shift the next turn's correlation.
+				a.dropSession(sess, "turn did not drain after cancel")
+			}
 			return acp.PromptResponse{}, rpc.ErrCancelled
 		}
 	}
@@ -60,13 +66,27 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 func (a *Agent) handleEvent(sess *Session, msg claude.Message) (done bool, stop string, rerr *rpc.Error) {
 	switch m := msg.(type) {
 	case *claude.StreamEvent:
+		if m.ParentToolUseID != "" {
+			return false, "", nil // subagent transcript (not supported in P1)
+		}
 		a.handleStreamEvent(sess, m)
 	case *claude.AssistantMessage:
+		if m.ParentToolUseID != "" {
+			return false, "", nil
+		}
 		a.handleAssistant(sess, m)
 	case *claude.UserMessage:
+		if m.ParentToolUseID != "" {
+			return false, "", nil
+		}
 		a.handleUser(sess, m)
 	case *claude.ResultMessage:
-		return true, a.resultStopReason(sess, m), a.resultError(m)
+		stop := a.resultStopReason(sess, m)
+		// Turns that end with a valid ACP stop reason are not RPC errors.
+		if stop == acp.StopReasonCancelled || stop == acp.StopReasonMaxTurnRequests {
+			return true, stop, nil
+		}
+		return true, stop, a.resultError(m)
 	case *claude.SystemMessage, *claude.KeepAlive:
 		// Session metadata and keep-alives need no ACP translation in P1.
 	}
@@ -213,20 +233,22 @@ func (a *Agent) exitError(sess *Session) string {
 	return "claude process exited: " + tail
 }
 
-func drainTurn(sess *Session) {
+// drainTurn consumes messages until the cancelled turn's result arrives. It
+// reports false when the turn did not settle in time.
+func drainTurn(sess *Session) bool {
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
 		case msg, ok := <-sess.client.Events():
 			if !ok {
-				return
+				return true
 			}
 			if _, isResult := msg.(*claude.ResultMessage); isResult {
-				return
+				return true
 			}
 		case <-timer.C:
-			return
+			return false
 		}
 	}
 }

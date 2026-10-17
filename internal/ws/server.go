@@ -99,25 +99,34 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	httpSrv := &http.Server{Handler: s}
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(shutdownCtx)
-		s.closeAllSlots()
-	}()
+	errCh := make(chan error, 1)
 
 	s.log.Info("claude-acp listening", "addr", s.cfg.Addr, "tls", s.cfg.TLSCert != "")
-	if s.cfg.TLSCert != "" {
-		err = httpSrv.ServeTLS(ln, s.cfg.TLSCert, s.cfg.TLSKey)
-	} else {
-		err = httpSrv.Serve(ln)
-	}
-	if errors.Is(err, http.ErrServerClosed) {
+	go func() {
+		if s.cfg.TLSCert != "" {
+			errCh <- httpSrv.ServeTLS(ln, s.cfg.TLSCert, s.cfg.TLSKey)
+			return
+		}
+		errCh <- httpSrv.Serve(ln)
+	}()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = httpSrv.Shutdown(shutdownCtx)
+		cancel()
+		// Wait for Serve to return, then terminate sessions synchronously so
+		// CLI process groups are reaped before the process exits.
+		<-errCh
+		s.closeAllSlots()
 		return nil
+	case err := <-errCh:
+		s.closeAllSlots()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
 	}
-	return err
 }
 
 // ServeHTTP implements http.Handler.

@@ -106,6 +106,11 @@ func main() {
 		fmt.Printf("configOptions -> %s\n", b)
 	}
 
+	cfgResp := call("session/set_config_option", message{"sessionId": sid, "configId": "model", "value": "default"})
+	fmt.Printf("set model -> ok=%v\n", cfgResp["result"] != nil)
+	cfgResp = call("session/set_config_option", message{"sessionId": sid, "configId": "effort", "value": "default"})
+	fmt.Printf("set effort -> ok=%v\n", cfgResp["result"] != nil)
+
 	listResp := call("session/list", message{"cwd": cwd})
 	if r, ok := listResp["result"].(map[string]any); ok {
 		if sessions, ok := r["sessions"].([]any); ok {

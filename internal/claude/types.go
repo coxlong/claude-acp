@@ -54,15 +54,15 @@ func (*StreamEvent) isMessage() {}
 
 // ResultMessage ends a turn.
 type ResultMessage struct {
-	Subtype        string
-	IsError        bool
-	Result         string
-	StopReason     string
-	TerminalReason string
-	Errors         []any
-	SessionID      string
-	NumTurns       int
-	Usage          map[string]any
+	Subtype        string         `json:"subtype"`
+	IsError        bool           `json:"is_error"`
+	Result         string         `json:"result"`
+	StopReason     string         `json:"stop_reason"`
+	TerminalReason string         `json:"terminal_reason"`
+	Errors         []any          `json:"errors"`
+	SessionID      string         `json:"session_id"`
+	NumTurns       int            `json:"num_turns"`
+	Usage          map[string]any `json:"usage"`
 }
 
 func (*ResultMessage) isMessage() {}

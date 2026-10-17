@@ -33,6 +33,7 @@ type Client struct {
 
 	events    chan Message
 	done      chan struct{}
+	doneOnce  sync.Once
 	closeOnce sync.Once
 
 	pendingMu sync.Mutex
@@ -104,8 +105,13 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 // Events yields non-control messages until the process exits.
 func (c *Client) Events() <-chan Message { return c.events }
 
-// Done is closed when the client terminates.
+// Done is closed when the client terminates, including an unexpected CLI
+// exit (not only Close).
 func (c *Client) Done() <-chan struct{} { return c.done }
+
+func (c *Client) markDone() {
+	c.doneOnce.Do(func() { close(c.done) })
+}
 
 // StderrTail returns the last stderr output, for diagnostics.
 func (c *Client) StderrTail() string {
@@ -117,7 +123,7 @@ func (c *Client) StderrTail() string {
 // Close terminates the process.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
-		close(c.done)
+		c.markDone()
 		_ = c.stdin.Close()
 
 		waited := make(chan struct{})
@@ -136,7 +142,10 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) readLoop(stdout io.ReadCloser) {
-	defer close(c.events)
+	defer func() {
+		c.markDone()
+		close(c.events)
+	}()
 	r := bufio.NewReaderSize(stdout, 1<<20)
 	for {
 		line, err := r.ReadBytes('\n')

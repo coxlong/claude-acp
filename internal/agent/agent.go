@@ -121,17 +121,21 @@ func (a *Agent) NewSession(ctx context.Context, req acp.NewSessionRequest) (acp.
 
 // LoadSession implements acp.Handler.
 func (a *Agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (acp.LoadSessionResponse, *rpc.Error) {
-	if req.SessionID == "" {
-		return acp.LoadSessionResponse{}, rpc.ErrInvalidParams("missing sessionId")
+	if !validSessionID(req.SessionID) {
+		return acp.LoadSessionResponse{}, rpc.ErrInvalidParams("invalid sessionId")
 	}
 	if errResp := a.validateCwd(req.Cwd); errResp != nil {
 		return acp.LoadSessionResponse{}, errResp
 	}
 	if existing := a.getSession(req.SessionID); existing != nil {
-		return acp.LoadSessionResponse{
-			Modes:         existing.modes(),
-			ConfigOptions: existing.snapshotConfigOptions(),
-		}, nil
+		if existing.isAlive() {
+			a.replayIfIdle(existing)
+			return acp.LoadSessionResponse{
+				Modes:         existing.modes(),
+				ConfigOptions: existing.snapshotConfigOptions(),
+			}, nil
+		}
+		a.dropSession(existing, "process exited")
 	}
 	if errResp := a.checkCapacity(); errResp != nil {
 		return acp.LoadSessionResponse{}, errResp
@@ -225,10 +229,11 @@ func (a *Agent) CloseSession(_ context.Context, req acp.CloseSessionRequest) (ac
 // Cancel implements acp.Handler.
 func (a *Agent) Cancel(ctx context.Context, req acp.CancelNotification) *rpc.Error {
 	sess := a.getSession(req.SessionID)
-	if sess == nil {
+	if sess == nil || !sess.isRunning() {
 		return nil
 	}
 	sess.markCancelled()
+	sess.cancelPermission()
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := sess.client.Interrupt(callCtx); err != nil {
@@ -307,6 +312,28 @@ func (a *Agent) getSession(id string) *Session {
 	return a.sessions[id]
 }
 
+// dropSession removes a session and terminates its CLI process.
+func (a *Agent) dropSession(sess *Session, reason string) {
+	a.mu.Lock()
+	if a.sessions[sess.id] == sess {
+		delete(a.sessions, sess.id)
+	}
+	a.mu.Unlock()
+	a.log.Info("session dropped", "sessionId", sess.id, "reason", reason)
+	_ = sess.client.Close()
+}
+
+// replayIfIdle replays transcript history when no prompt is running. A load
+// during an active turn returns the current state without interleaving
+// history notifications into the turn.
+func (a *Agent) replayIfIdle(sess *Session) {
+	if !sess.promptMu.TryLock() {
+		return
+	}
+	defer sess.promptMu.Unlock()
+	a.replayHistory(sess)
+}
+
 func (a *Agent) checkCapacity() *rpc.Error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -330,7 +357,8 @@ func (a *Agent) validateCwd(cwd string) *rpc.Error {
 	if a.cfg.CwdRoot != "" {
 		root := filepath.Clean(a.cfg.CwdRoot)
 		clean := filepath.Clean(cwd)
-		if clean != root && !strings.HasPrefix(clean+string(os.PathSeparator), root+string(os.PathSeparator)) {
+		rel, err := filepath.Rel(root, clean)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 			return rpc.ErrInvalidParams("cwd is outside the allowed root")
 		}
 	}
@@ -364,7 +392,11 @@ func mcpConfigArg(servers []acp.McpServer) string {
 		if s.Type == "http" || s.Type == "sse" {
 			entry := map[string]any{"type": s.Type, "url": s.URL}
 			if len(s.Headers) > 0 {
-				entry["headers"] = s.Headers
+				headers := make(map[string]string, len(s.Headers))
+				for _, h := range s.Headers {
+					headers[h.Name] = h.Value
+				}
+				entry["headers"] = headers
 			}
 			cfg[s.Name] = entry
 			continue
@@ -374,7 +406,11 @@ func mcpConfigArg(servers []acp.McpServer) string {
 			entry["args"] = s.Args
 		}
 		if len(s.Env) > 0 {
-			entry["env"] = s.Env
+			env := make(map[string]string, len(s.Env))
+			for _, e := range s.Env {
+				env[e.Name] = e.Value
+			}
+			entry["env"] = env
 		}
 		cfg[s.Name] = entry
 	}
@@ -383,6 +419,28 @@ func mcpConfigArg(servers []acp.McpServer) string {
 		return ""
 	}
 	return string(b)
+}
+
+// validSessionID accepts the UUID form this agent generates and stores as a
+// transcript filename. Rejecting anything else prevents path traversal via a
+// client-supplied session id.
+func validSessionID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i, c := range id {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func newUUID() string {

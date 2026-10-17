@@ -69,14 +69,26 @@ type AuthenticateResponse struct{}
 
 // ---- Sessions ----
 
+// EnvVariable is one environment variable entry of a stdio MCP server.
+type EnvVariable struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// HttpHeader is one header entry of an HTTP/SSE MCP server.
+type HttpHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type McpServer struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Type    string            `json:"type,omitempty"`
-	URL     string            `json:"url,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
+	Name    string        `json:"name"`
+	Command string        `json:"command,omitempty"`
+	Args    []string      `json:"args,omitempty"`
+	Env     []EnvVariable `json:"env,omitempty"`
+	Type    string        `json:"type,omitempty"`
+	URL     string        `json:"url,omitempty"`
+	Headers []HttpHeader  `json:"headers,omitempty"`
 }
 
 type NewSessionRequest struct {

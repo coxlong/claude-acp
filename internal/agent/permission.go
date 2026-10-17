@@ -56,7 +56,7 @@ func (a *Agent) requestPermission(sess *Session, req *claude.PermissionRequest) 
 	}
 
 	var resp acp.RequestPermissionResponse
-	if err := a.conn.Call(sess.turnContext(), acp.ClientRequestPermission, call, &resp); err != nil {
+	if err := a.conn.Call(sess.permissionContext(), acp.ClientRequestPermission, call, &resp); err != nil {
 		return claude.Deny("permission request failed: " + err.Error()), nil
 	}
 

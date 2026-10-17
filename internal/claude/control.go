@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 type controlResult struct {
@@ -24,6 +25,18 @@ func newControlID() string {
 
 // request sends a control request and waits for its response.
 func (c *Client) request(ctx context.Context, subtype string, payload map[string]any, out any) error {
+	// Every control request needs a deadline: a wedged CLI must not block a
+	// session forever.
+	timeout := 10 * time.Second
+	switch subtype {
+	case "initialize":
+		timeout = 60 * time.Second
+	case "interrupt":
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	id := newControlID()
 	req := make(map[string]any, len(payload)+1)
 	req["subtype"] = subtype

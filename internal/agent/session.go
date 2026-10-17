@@ -25,7 +25,10 @@ type Session struct {
 	models        []claude.ModelInfo
 	configOptions []acp.SessionConfigOption
 	cancelled     bool
+	running       bool
 	turnCtx       context.Context
+	permCtx       context.Context
+	permCancel    context.CancelFunc
 	sawText       bool
 	sawThinking   bool
 	toolCalls     map[string]bool
@@ -198,28 +201,68 @@ func (s *Session) wasCancelled() bool {
 	return s.cancelled
 }
 
-func (s *Session) resetTurn() {
+// beginTurn marks a turn as running and creates the cancellable context used
+// by permission requests.
+func (s *Session) beginTurn(ctx context.Context) {
 	s.mu.Lock()
 	s.cancelled = false
 	s.sawText = false
 	s.sawThinking = false
-	s.turnCtx = nil
-	s.mu.Unlock()
-}
-
-func (s *Session) setTurnCtx(ctx context.Context) {
-	s.mu.Lock()
+	s.running = true
 	s.turnCtx = ctx
+	s.permCtx, s.permCancel = context.WithCancel(ctx)
+	s.toolCalls = make(map[string]bool)
 	s.mu.Unlock()
 }
 
-func (s *Session) turnContext() context.Context {
+// endTurn clears per-turn state.
+func (s *Session) endTurn() {
+	s.mu.Lock()
+	if s.permCancel != nil {
+		s.permCancel()
+	}
+	s.permCtx = nil
+	s.permCancel = nil
+	s.turnCtx = nil
+	s.running = false
+	s.mu.Unlock()
+}
+
+func (s *Session) isRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.turnCtx == nil {
+	return s.running
+}
+
+// permissionContext is cancelled when the turn is cancelled or ends.
+func (s *Session) permissionContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.permCtx == nil {
 		return context.Background()
 	}
-	return s.turnCtx
+	return s.permCtx
+}
+
+func (s *Session) cancelPermission() {
+	s.mu.Lock()
+	cancel := s.permCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Session) isAlive() bool {
+	if s.client == nil {
+		return false
+	}
+	select {
+	case <-s.client.Done():
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Session) markTextDelta() {
