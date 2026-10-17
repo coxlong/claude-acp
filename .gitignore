@@ -1,0 +1,4 @@
+/claude-acp
+/dist/
+*.test
+.DS_Store
