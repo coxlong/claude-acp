@@ -103,10 +103,11 @@ type PermissionRequest struct {
 
 // PermissionResult is returned by the CanUseTool callback.
 type PermissionResult struct {
-	Behavior     string // "allow" or "deny"
-	UpdatedInput map[string]any
-	Message      string
-	Interrupt    bool
+	Behavior           string // "allow" or "deny"
+	UpdatedInput       map[string]any
+	UpdatedPermissions []map[string]any
+	Message            string
+	Interrupt          bool
 }
 
 // Allow returns an allow result.

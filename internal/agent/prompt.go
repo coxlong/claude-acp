@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,17 +28,22 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 	}
 	defer sess.promptMu.Unlock()
 
-	sess.beginTurn(ctx)
+	if sess.beginTurn(ctx) {
+		// A session/cancel raced the prompt dispatch.
+		return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+	}
 	defer sess.endTurn()
 
 	if err := sess.client.SendUserText(text); err != nil {
 		return acp.PromptResponse{}, rpc.ErrInternalMsg(err.Error())
 	}
 
+	turnCtx := sess.turnContext()
 	for {
 		select {
 		case msg, ok := <-sess.client.Events():
 			if !ok {
+				a.dropSession(sess, "process exited during prompt")
 				return acp.PromptResponse{}, rpc.ErrInternalMsg(a.exitError(sess))
 			}
 			done, stop, rerr := a.handleEvent(sess, msg)
@@ -47,43 +53,43 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 			if done {
 				return acp.PromptResponse{StopReason: stop}, nil
 			}
-		case <-ctx.Done():
-			// The turn was cancelled at the protocol level. Ask the CLI to
-			// stop, then drain the rest of the turn so the next prompt does
-			// not consume its messages.
-			sess.cancelPermission()
+		case <-turnCtx.Done():
+			// Either session/cancel cancelled the turn context, or the
+			// JSON-RPC request itself was cancelled ($/cancel_request).
 			_ = sess.client.Interrupt(context.Background())
 			if !drainTurn(sess) {
 				// The CLI did not settle in time; kill it so stale events
 				// cannot shift the next turn's correlation.
 				a.dropSession(sess, "turn did not drain after cancel")
 			}
-			return acp.PromptResponse{}, rpc.ErrCancelled
+			if ctx.Err() != nil {
+				// The prompt request itself was cancelled (-32800).
+				return acp.PromptResponse{}, rpc.ErrCancelled
+			}
+			// session/cancel: the prompt answers with a stop reason.
+			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 		}
 	}
 }
 
 func (a *Agent) handleEvent(sess *Session, msg claude.Message) (done bool, stop string, rerr *rpc.Error) {
+	// Subagent messages carry ParentToolUseID, but this agent does not
+	// advertise the subagent-transcript capability; the CLI's legacy
+	// flattened mode is forwarded as-is so tool results always pair with the
+	// permission requests that announce them.
 	switch m := msg.(type) {
 	case *claude.StreamEvent:
-		if m.ParentToolUseID != "" {
-			return false, "", nil // subagent transcript (not supported in P1)
-		}
 		a.handleStreamEvent(sess, m)
 	case *claude.AssistantMessage:
-		if m.ParentToolUseID != "" {
-			return false, "", nil
-		}
 		a.handleAssistant(sess, m)
 	case *claude.UserMessage:
-		if m.ParentToolUseID != "" {
-			return false, "", nil
-		}
 		a.handleUser(sess, m)
 	case *claude.ResultMessage:
 		stop := a.resultStopReason(sess, m)
 		// Turns that end with a valid ACP stop reason are not RPC errors.
-		if stop == acp.StopReasonCancelled || stop == acp.StopReasonMaxTurnRequests {
+		switch stop {
+		case acp.StopReasonCancelled, acp.StopReasonMaxTurnRequests,
+			acp.StopReasonMaxTokens, acp.StopReasonRefusal:
 			return true, stop, nil
 		}
 		return true, stop, a.resultError(m)
@@ -255,12 +261,36 @@ func drainTurn(sess *Session) bool {
 
 func promptText(blocks []acp.ContentBlock) string {
 	var b strings.Builder
+	appendLine := func(s string) {
+		if s == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(s)
+	}
 	for _, block := range blocks {
-		if block.Type == "text" && block.Text != "" {
-			if b.Len() > 0 {
-				b.WriteByte('\n')
+		switch block.Type {
+		case "text":
+			appendLine(block.Text)
+		case "resource_link":
+			// resource_link is a baseline ACP content type. Render it as a
+			// readable reference; file:// URIs become local paths.
+			ref := block.Name
+			if ref == "" {
+				ref = block.URI
 			}
-			b.WriteString(block.Text)
+			uri := block.URI
+			if strings.HasPrefix(uri, "file://") {
+				if u, err := url.Parse(uri); err == nil && u.Path != "" {
+					uri = u.Path
+				}
+			}
+			if uri != "" && uri != ref {
+				ref += " (" + uri + ")"
+			}
+			appendLine("Resource: " + ref)
 		}
 	}
 	return b.String()

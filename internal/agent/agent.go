@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,10 @@ type Agent struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	closed   bool
+
+	// loadMu serializes session/load so concurrent retries cannot spawn two
+	// CLI processes for the same session id.
+	loadMu sync.Mutex
 }
 
 // New creates an agent bound to one logical ACP connection.
@@ -127,9 +132,15 @@ func (a *Agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (ac
 	if errResp := a.validateCwd(req.Cwd); errResp != nil {
 		return acp.LoadSessionResponse{}, errResp
 	}
+
+	a.loadMu.Lock()
+	defer a.loadMu.Unlock()
+
 	if existing := a.getSession(req.SessionID); existing != nil {
 		if existing.isAlive() {
-			a.replayIfIdle(existing)
+			if !a.replayIfIdle(existing) {
+				return acp.LoadSessionResponse{}, rpc.ErrInvalidParams("session is busy; retry after the current turn")
+			}
 			return acp.LoadSessionResponse{
 				Modes:         existing.modes(),
 				ConfigOptions: existing.snapshotConfigOptions(),
@@ -190,11 +201,15 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 	sess.models = client.Models()
 	sess.buildConfigOptions()
 
+	if errResp := a.checkCapacity(); errResp != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("%s", errResp.Message)
+	}
 	a.mu.Lock()
-	if a.closed || len(a.sessions) >= a.cfg.MaxSessions {
+	if a.closed {
 		a.mu.Unlock()
 		_ = client.Close()
-		return nil, fmt.Errorf("session limit reached")
+		return nil, fmt.Errorf("agent closed")
 	}
 	a.sessions[id] = sess
 	a.mu.Unlock()
@@ -210,7 +225,26 @@ func (a *Agent) ListSessions(_ context.Context, req acp.ListSessionsRequest) (ac
 	if infos == nil {
 		infos = []acp.SessionInfo{}
 	}
-	return acp.ListSessionsResponse{Sessions: infos}, nil
+
+	offset := 0
+	if req.Cursor != "" {
+		if n, err := strconv.Atoi(req.Cursor); err == nil && n > 0 {
+			offset = n
+		}
+	}
+	if offset > len(infos) {
+		offset = len(infos)
+	}
+	end := offset + historyMaxItems
+	if end > len(infos) {
+		end = len(infos)
+	}
+
+	resp := acp.ListSessionsResponse{Sessions: infos[offset:end]}
+	if end < len(infos) {
+		resp.NextCursor = strconv.Itoa(end)
+	}
+	return resp, nil
 }
 
 // CloseSession implements acp.Handler.
@@ -229,11 +263,16 @@ func (a *Agent) CloseSession(_ context.Context, req acp.CloseSessionRequest) (ac
 // Cancel implements acp.Handler.
 func (a *Agent) Cancel(ctx context.Context, req acp.CancelNotification) *rpc.Error {
 	sess := a.getSession(req.SessionID)
-	if sess == nil || !sess.isRunning() {
+	if sess == nil {
+		return nil
+	}
+	if !sess.isRunning() {
+		// The prompt may have been dispatched but not started yet.
+		sess.markCancelPending()
 		return nil
 	}
 	sess.markCancelled()
-	sess.cancelPermission()
+	sess.cancelTurn()
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := sess.client.Interrupt(callCtx); err != nil {
@@ -323,24 +362,38 @@ func (a *Agent) dropSession(sess *Session, reason string) {
 	_ = sess.client.Close()
 }
 
-// replayIfIdle replays transcript history when no prompt is running. A load
-// during an active turn returns the current state without interleaving
-// history notifications into the turn.
-func (a *Agent) replayIfIdle(sess *Session) {
+// replayIfIdle replays transcript history when no prompt is running. It
+// reports false so callers can refuse a load during an active turn instead of
+// silently returning no history.
+func (a *Agent) replayIfIdle(sess *Session) bool {
 	if !sess.promptMu.TryLock() {
-		return
+		return false
 	}
 	defer sess.promptMu.Unlock()
 	a.replayHistory(sess)
+	return true
 }
 
 func (a *Agent) checkCapacity() *rpc.Error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.closed {
+		a.mu.Unlock()
 		return rpc.ErrClosed
 	}
-	if len(a.sessions) >= a.cfg.MaxSessions {
+	var dead []*Session
+	for id, sess := range a.sessions {
+		if !sess.isAlive() {
+			delete(a.sessions, id)
+			dead = append(dead, sess)
+		}
+	}
+	over := len(a.sessions) >= a.cfg.MaxSessions
+	a.mu.Unlock()
+
+	for _, sess := range dead {
+		_ = sess.client.Close()
+	}
+	if over {
 		return rpc.ErrInvalidParams("session limit reached")
 	}
 	return nil
@@ -357,7 +410,16 @@ func (a *Agent) validateCwd(cwd string) *rpc.Error {
 	if a.cfg.CwdRoot != "" {
 		root := filepath.Clean(a.cfg.CwdRoot)
 		clean := filepath.Clean(cwd)
-		rel, err := filepath.Rel(root, clean)
+		// Resolve symlinks so a link inside the root cannot escape it.
+		rootReal, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			return rpc.ErrInvalidParams("invalid cwd root: " + err.Error())
+		}
+		cwdReal, err := filepath.EvalSymlinks(clean)
+		if err != nil {
+			return rpc.ErrInvalidParams("invalid cwd: " + err.Error())
+		}
+		rel, err := filepath.Rel(rootReal, cwdReal)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 			return rpc.ErrInvalidParams("cwd is outside the allowed root")
 		}

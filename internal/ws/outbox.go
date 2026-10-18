@@ -44,26 +44,25 @@ func (o *outbox) push(frame []byte) bool {
 	return true
 }
 
-// requeue prepends frames that were drained but not delivered. It is used
-// when a write fails or a physical connection is replaced mid-batch.
-func (o *outbox) requeue(frames [][]byte) {
+// requeue prepends frames that were drained but not delivered. It reports
+// false when the outbox is closed or the frames no longer fit; the caller
+// must then terminate the slot rather than silently dropping responses.
+func (o *outbox) requeue(frames [][]byte) bool {
 	if len(frames) == 0 {
-		return
+		return true
 	}
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
-		return
+		return false
 	}
 	o.frames = append(frames, o.frames...)
 	for _, frame := range frames {
 		o.size += len(frame)
 	}
-	// Shed the newest frames if requeueing pushed us over budget.
-	for o.size > o.max && len(o.frames) > 0 {
-		last := len(o.frames) - 1
-		o.size -= len(o.frames[last])
-		o.frames = o.frames[:last]
+	if o.size > o.max {
+		o.mu.Unlock()
+		return false
 	}
 	o.mu.Unlock()
 
@@ -71,6 +70,7 @@ func (o *outbox) requeue(frames [][]byte) {
 	case o.notify <- struct{}{}:
 	default:
 	}
+	return true
 }
 
 // drain removes and returns all queued frames.

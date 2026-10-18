@@ -8,6 +8,12 @@ import (
 // requestPermission bridges a CLI can_use_tool control request to an ACP
 // session/request_permission call.
 func (a *Agent) requestPermission(sess *Session, req *claude.PermissionRequest) (claude.PermissionResult, error) {
+	if !sess.isRunning() {
+		// The turn already ended (e.g. an interrupted tool); do not block on
+		// a client that will never answer.
+		return claude.Deny("turn already ended"), nil
+	}
+
 	title := req.Title
 	if title == "" {
 		title = req.DisplayName
@@ -36,11 +42,12 @@ func (a *Agent) requestPermission(sess *Session, req *claude.PermissionRequest) 
 		})
 	}
 
+	// Persistent deny is not supported by the CLI permission result, so only
+	// a one-shot deny is offered.
 	options := []acp.PermissionOption{
 		{OptionID: "allow", Name: "Allow Once", Kind: acp.PermissionAllowOnce},
 		{OptionID: "allow_always", Name: "Always Allow", Kind: acp.PermissionAllowAlways},
 		{OptionID: "reject", Name: "Deny", Kind: acp.PermissionRejectOnce},
-		{OptionID: "reject_always", Name: "Always Deny", Kind: acp.PermissionRejectAlways},
 	}
 
 	call := acp.RequestPermissionRequest{
@@ -56,7 +63,7 @@ func (a *Agent) requestPermission(sess *Session, req *claude.PermissionRequest) 
 	}
 
 	var resp acp.RequestPermissionResponse
-	if err := a.conn.Call(sess.permissionContext(), acp.ClientRequestPermission, call, &resp); err != nil {
+	if err := a.conn.Call(sess.turnContext(), acp.ClientRequestPermission, call, &resp); err != nil {
 		return claude.Deny("permission request failed: " + err.Error()), nil
 	}
 
@@ -68,8 +75,23 @@ func (a *Agent) requestPermission(sess *Session, req *claude.PermissionRequest) 
 		}, nil
 	}
 	switch resp.Outcome.OptionID {
-	case "allow", "allow_always":
+	case "allow":
 		return claude.Allow(req.Input), nil
+	case "allow_always":
+		updates := req.Suggestions
+		if len(updates) == 0 {
+			updates = []map[string]any{{
+				"type":        "addRules",
+				"rules":       []map[string]any{{"toolName": req.ToolName}},
+				"behavior":    "allow",
+				"destination": "session",
+			}}
+		}
+		return claude.PermissionResult{
+			Behavior:           "allow",
+			UpdatedInput:       req.Input,
+			UpdatedPermissions: updates,
+		}, nil
 	default:
 		return claude.Deny("User denied this tool call"), nil
 	}

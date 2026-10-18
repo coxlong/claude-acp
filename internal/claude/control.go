@@ -162,6 +162,9 @@ func (c *Client) handleControlRequest(env controlRequest) {
 			if result.UpdatedInput != nil {
 				payload["updatedInput"] = result.UpdatedInput
 			}
+			if len(result.UpdatedPermissions) > 0 {
+				payload["updatedPermissions"] = result.UpdatedPermissions
+			}
 		} else {
 			if result.Message != "" {
 				payload["message"] = result.Message

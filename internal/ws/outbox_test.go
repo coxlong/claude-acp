@@ -14,11 +14,25 @@ func TestOutboxRequeuePreservesOrder(t *testing.T) {
 
 	// "a" was delivered; "b" was not. New output arrives while requeueing.
 	o.push([]byte("c"))
-	o.requeue(frames[1:])
+	if !o.requeue(frames[1:]) {
+		t.Fatal("requeue rejected within budget")
+	}
 
 	got := o.drain()
 	if len(got) != 2 || string(got[0]) != "b" || string(got[1]) != "c" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestOutboxRequeueOverflow(t *testing.T) {
+	o := newOutbox(4)
+	o.push([]byte("ab"))
+	o.push([]byte("cd"))
+	frames := o.drain()
+
+	o.push([]byte("efgh"))
+	if o.requeue(frames[1:]) {
+		t.Fatal("requeue over budget should fail instead of dropping frames")
 	}
 }
 

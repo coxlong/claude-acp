@@ -80,9 +80,6 @@ func (a *Agent) listSessions(cwd string) ([]acp.SessionInfo, error) {
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
-	if len(out) > historyMaxItems {
-		out = out[:historyMaxItems]
-	}
 	return out, nil
 }
 

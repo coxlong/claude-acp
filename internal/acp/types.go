@@ -143,7 +143,8 @@ type LoadSessionResponse struct {
 }
 
 type ListSessionsRequest struct {
-	Cwd string `json:"cwd,omitempty"`
+	Cwd    string `json:"cwd,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
 }
 
 type SessionInfo struct {
@@ -154,7 +155,8 @@ type SessionInfo struct {
 }
 
 type ListSessionsResponse struct {
-	Sessions []SessionInfo `json:"sessions"`
+	Sessions   []SessionInfo `json:"sessions"`
+	NextCursor string        `json:"nextCursor,omitempty"`
 }
 
 type CloseSessionRequest struct {
@@ -185,6 +187,13 @@ type SetSessionConfigOptionResponse struct {
 type ContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
+
+	// resource_link (baseline content type)
+	URI         string `json:"uri,omitempty"`
+	Name        string `json:"name,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+	Description string `json:"description,omitempty"`
+	Size        *int64 `json:"size,omitempty"`
 }
 
 type PromptRequest struct {

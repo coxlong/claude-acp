@@ -157,6 +157,22 @@ func (c *Conn) Notify(ctx context.Context, method string, params any) error {
 	return c.write(&Request{JSONRPC: Version, Method: method, Params: rawParams})
 }
 
+// FailPending fails every pending outbound call. It is used when a frame
+// arriving from the peer cannot be parsed and may have been a response.
+func (c *Conn) FailPending(err *Error) {
+	c.mu.Lock()
+	pending := c.pending
+	c.pending = make(map[string]chan *Response)
+	c.mu.Unlock()
+
+	for _, ch := range pending {
+		select {
+		case ch <- &Response{JSONRPC: Version, Error: err}:
+		default:
+		}
+	}
+}
+
 // Close terminates the connection.
 func (c *Conn) Close() error {
 	c.shutdown(ErrClosed)

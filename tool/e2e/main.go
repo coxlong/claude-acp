@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,8 +22,14 @@ func main() {
 		os.Exit(2)
 	}
 	url, cwd := os.Args[1], os.Args[2]
-	listOnly := len(os.Args) > 3 && os.Args[3] == "list"
-	loadMode := len(os.Args) > 3 && os.Args[3] == "load"
+	mode := ""
+	if len(os.Args) > 3 {
+		mode = os.Args[3]
+	}
+	listOnly := mode == "list"
+	loadMode := mode == "load"
+	cancelMode := mode == "cancel"
+	cancelRace := mode == "cancel-race"
 
 	headers := http.Header{}
 	if token := os.Getenv("CLAUDE_ACP_TOKEN"); token != "" {
@@ -111,6 +118,56 @@ func main() {
 		fmt.Printf("configOptions -> %s\n", b)
 	}
 
+	if cancelMode || cancelRace {
+		id := nextID
+		nextID++
+		write(conn, message{
+			"jsonrpc": "2.0", "id": id, "method": "session/prompt",
+			"params": message{
+				"sessionId": sid,
+				"prompt":    []any{message{"type": "text", "text": "Run `sleep 30` and then report done."}},
+			},
+		})
+		if cancelRace {
+			write(conn, message{
+				"jsonrpc": "2.0", "method": "session/cancel",
+				"params": message{"sessionId": sid},
+			})
+		} else {
+			go func() {
+				time.Sleep(2 * time.Second)
+				write(conn, message{
+					"jsonrpc": "2.0", "method": "session/cancel",
+					"params": message{"sessionId": sid},
+				})
+			}()
+		}
+		for {
+			msg := read(conn)
+			if str(msg["method"]) == "session/request_permission" {
+				write(conn, message{
+					"jsonrpc": "2.0", "id": msg["id"],
+					"result": message{"outcome": message{"outcome": "selected", "optionId": "allow"}},
+				})
+				continue
+			}
+			if str(msg["method"]) != "" {
+				printUpdate(msg)
+				continue
+			}
+			if fmt.Sprint(msg["id"]) == fmt.Sprint(id) {
+				result, _ := msg["result"].(map[string]any)
+				stop := str(result["stopReason"])
+				fmt.Printf("cancel -> %v\n", stop)
+				if stop != "cancelled" {
+					os.Exit(1)
+				}
+				_ = call("session/close", message{"sessionId": sid})
+				return
+			}
+		}
+	}
+
 	cfgResp := call("session/set_config_option", message{"sessionId": sid, "configId": "model", "value": "default"})
 	fmt.Printf("set model -> ok=%v\n", cfgResp["result"] != nil)
 	cfgResp = call("session/set_config_option", message{"sessionId": sid, "configId": "effort", "value": "default"})
@@ -177,11 +234,17 @@ func read(conn *websocket.Conn) message {
 	return m
 }
 
+var writeMu sync.Mutex
+
 func write(conn *websocket.Conn, m message) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		fatal("encode: %v", err)
 	}
+	// Serialize writes: the cancel test writes from a goroutine while the
+	// main loop may answer a permission request.
+	writeMu.Lock()
+	defer writeMu.Unlock()
 	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
 		fatal("write: %v", err)
 	}

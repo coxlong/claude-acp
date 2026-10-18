@@ -46,6 +46,10 @@ type Slot struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// connMu serializes physical connection handoff (attach/detach/close) so
+	// an old writer cannot requeue frames after a new writer started.
+	connMu sync.Mutex
+
 	mu     sync.Mutex
 	phys   *physical
 	gen    uint64
@@ -101,7 +105,15 @@ func (s *Slot) ReadObject(v any) error {
 			return io.EOF
 		case frame := <-s.inbound:
 			if err := json.Unmarshal(frame, v); err != nil {
-				s.log.Warn("dropping malformed frame", "err", err)
+				if bytes.Contains(frame, []byte(`"method"`)) {
+					s.log.Warn("dropping malformed request frame", "err", err)
+				} else {
+					// It may have been a response to an agent -> client
+					// call; fail pending calls so the CLI is not left
+					// waiting for an answer that will never arrive.
+					s.log.Warn("malformed non-request frame; failing pending calls", "err", err)
+					s.conn.FailPending(rpc.ErrInvalidRequest)
+				}
 				continue
 			}
 			return nil
@@ -135,6 +147,8 @@ func (s *Slot) enqueue(frame []byte) error {
 func (s *Slot) closeWithReason(reason string) {
 	s.closeOnce.Do(func() {
 		s.log.Info("slot closing", "reason", reason)
+
+		s.connMu.Lock()
 		s.mu.Lock()
 		s.closed = true
 		if s.grace != nil {
@@ -146,9 +160,15 @@ func (s *Slot) closeWithReason(reason string) {
 		s.mu.Unlock()
 
 		if p != nil {
-			_ = p.conn.Close()
 			close(p.done)
+			_ = p.conn.Close()
+			select {
+			case <-p.writerDone:
+			case <-time.After(2 * time.Second):
+			}
 		}
+		s.connMu.Unlock()
+
 		close(s.done)
 		s.out.close()
 
@@ -167,6 +187,9 @@ func (s *Slot) isClosed() bool {
 
 // attach binds a physical connection and starts its writer pump.
 func (s *Slot) attach(conn *websocket.Conn, reconnect bool) *physical {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
 	var old *physical
 
 	s.mu.Lock()
@@ -179,8 +202,8 @@ func (s *Slot) attach(conn *websocket.Conn, reconnect bool) *physical {
 		s.grace.Stop()
 		s.grace = nil
 	}
-	if s.phys != nil {
-		old = s.phys
+	old = s.phys
+	if old != nil {
 		close(old.done)
 	}
 	s.gen++
@@ -262,14 +285,18 @@ func (s *Slot) writePump(p *physical) {
 		for i, frame := range frames {
 			select {
 			case <-p.done:
-				s.out.requeue(frames[i:])
+				if !s.out.requeue(frames[i:]) {
+					go s.closeWithReason("outbox overflow after requeue")
+				}
 				return
 			default:
 			}
 			_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if err := p.conn.WriteMessage(websocket.TextMessage, frame); err != nil {
 				// Requeue undelivered frames for the next connection.
-				s.out.requeue(frames[i:])
+				if !s.out.requeue(frames[i:]) {
+					go s.closeWithReason("outbox overflow after requeue")
+				}
 				_ = p.conn.Close()
 				return
 			}
@@ -278,26 +305,40 @@ func (s *Slot) writePump(p *physical) {
 }
 
 func (s *Slot) detach(p *physical) {
+	s.connMu.Lock()
+
 	s.mu.Lock()
 	if s.phys != p {
 		s.mu.Unlock()
+		s.connMu.Unlock()
 		return
 	}
 	s.phys = nil
 	close(p.done)
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	grace := s.srv.cfg.SessionGrace
-	if grace > 0 {
-		s.grace = time.AfterFunc(grace, func() {
-			s.closeWithReason("session grace expired")
-		})
-	}
+	closed := s.closed
 	s.mu.Unlock()
 
-	if grace <= 0 {
+	// Close the socket and wait for the writer, so a reconnect cannot start
+	// a new pump while this one is still able to requeue old frames.
+	_ = p.conn.Close()
+	select {
+	case <-p.writerDone:
+	case <-time.After(2 * time.Second):
+	}
+
+	grace := s.srv.cfg.SessionGrace
+	if !closed {
+		s.mu.Lock()
+		if !s.closed && s.phys == nil && grace > 0 {
+			s.grace = time.AfterFunc(grace, func() {
+				s.closeWithReason("session grace expired")
+			})
+		}
+		s.mu.Unlock()
+	}
+	s.connMu.Unlock()
+
+	if !closed && grace <= 0 {
 		s.closeWithReason("disconnected")
 	}
 }

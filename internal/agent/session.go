@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/coxlong/claude-acp/internal/acp"
 	"github.com/coxlong/claude-acp/internal/claude"
@@ -18,20 +19,21 @@ type Session struct {
 	// promptMu serializes prompts within a session.
 	promptMu sync.Mutex
 
-	mu            sync.Mutex
-	mode          string
-	model         string
-	effort        string
-	models        []claude.ModelInfo
-	configOptions []acp.SessionConfigOption
-	cancelled     bool
-	running       bool
-	turnCtx       context.Context
-	permCtx       context.Context
-	permCancel    context.CancelFunc
-	sawText       bool
-	sawThinking   bool
-	toolCalls     map[string]bool
+	mu              sync.Mutex
+	mode            string
+	model           string
+	effort          string
+	models          []claude.ModelInfo
+	configOptions   []acp.SessionConfigOption
+	cancelled       bool
+	running         bool
+	turnCtx         context.Context
+	turnCancel      context.CancelFunc
+	cancelPending   bool
+	cancelPendingAt time.Time
+	sawText         bool
+	sawThinking     bool
+	toolCalls       map[string]bool
 }
 
 func (s *Session) modes() *acp.SessionModeState {
@@ -201,30 +203,37 @@ func (s *Session) wasCancelled() bool {
 	return s.cancelled
 }
 
-// beginTurn marks a turn as running and creates the cancellable context used
-// by permission requests.
-func (s *Session) beginTurn(ctx context.Context) {
+// beginTurn marks a turn as running and creates the cancellable context shared
+// by the prompt loop and permission requests. It reports whether a cancel
+// arrived between the prompt's dispatch and this call.
+func (s *Session) beginTurn(ctx context.Context) bool {
 	s.mu.Lock()
-	s.cancelled = false
+	defer s.mu.Unlock()
+
 	s.sawText = false
 	s.sawThinking = false
 	s.running = true
-	s.turnCtx = ctx
-	s.permCtx, s.permCancel = context.WithCancel(ctx)
+	s.turnCtx, s.turnCancel = context.WithCancel(ctx)
 	s.toolCalls = make(map[string]bool)
-	s.mu.Unlock()
+	s.cancelled = false
+
+	if s.cancelPending && time.Since(s.cancelPendingAt) <= 5*time.Second {
+		s.cancelled = true
+	}
+	s.cancelPending = false
+	return s.cancelled
 }
 
-// endTurn clears per-turn state.
+// endTurn clears per-turn state and releases any pending permission wait.
 func (s *Session) endTurn() {
 	s.mu.Lock()
-	if s.permCancel != nil {
-		s.permCancel()
+	if s.turnCancel != nil {
+		s.turnCancel()
 	}
-	s.permCtx = nil
-	s.permCancel = nil
+	s.turnCancel = nil
 	s.turnCtx = nil
 	s.running = false
+	s.cancelled = false
 	s.mu.Unlock()
 }
 
@@ -234,23 +243,38 @@ func (s *Session) isRunning() bool {
 	return s.running
 }
 
-// permissionContext is cancelled when the turn is cancelled or ends.
-func (s *Session) permissionContext() context.Context {
+// turnContext is the context for the active turn. When no turn is active it
+// returns an already-cancelled context so a late caller cannot block.
+func (s *Session) turnContext() context.Context {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.permCtx == nil {
-		return context.Background()
+	if s.turnCtx != nil {
+		return s.turnCtx
 	}
-	return s.permCtx
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
 }
 
-func (s *Session) cancelPermission() {
+// cancelTurn cancels the active turn's context (prompt loop and permission
+// calls) without marking the session cancelled.
+func (s *Session) cancelTurn() {
 	s.mu.Lock()
-	cancel := s.permCancel
+	cancel := s.turnCancel
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// markCancelPending records a cancel that raced ahead of the prompt dispatch.
+func (s *Session) markCancelPending() {
+	s.mu.Lock()
+	if !s.running {
+		s.cancelPending = true
+		s.cancelPendingAt = time.Now()
+	}
+	s.mu.Unlock()
 }
 
 func (s *Session) isAlive() bool {

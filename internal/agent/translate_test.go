@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coxlong/claude-acp/internal/acp"
 	"github.com/coxlong/claude-acp/internal/claude"
@@ -126,6 +127,15 @@ func TestValidateCwdRoot(t *testing.T) {
 		t.Fatal("outside root accepted")
 	}
 
+	// A symlink inside the root must not be usable to escape it.
+	link := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := a.validateCwd(link); err == nil {
+		t.Fatal("symlink escape accepted")
+	}
+
 	// The filesystem root is a valid (if unusual) allowlist root.
 	rootAgent := &Agent{cfg: Config{CwdRoot: "/"}}
 	if err := rootAgent.validateCwd("/tmp"); err != nil {
@@ -157,9 +167,51 @@ func TestResultEventMapping(t *testing.T) {
 		t.Fatalf("max turns: done=%v stop=%q err=%v", done, stop, rerr)
 	}
 
+	for _, tc := range []struct {
+		reason string
+		want   string
+	}{
+		{"max_tokens", acp.StopReasonMaxTokens},
+		{"refusal", acp.StopReasonRefusal},
+	} {
+		done, stop, rerr = a.handleEvent(sess, &claude.ResultMessage{
+			Subtype: "success", IsError: true, StopReason: tc.reason,
+		})
+		if !done || stop != tc.want || rerr != nil {
+			t.Fatalf("%s: done=%v stop=%q err=%v", tc.reason, done, stop, rerr)
+		}
+	}
+
 	done, stop, rerr = a.handleEvent(sess, &claude.ResultMessage{Subtype: "error_during_execution", IsError: true, Result: "boom"})
 	if !done || stop != acp.StopReasonEndTurn || rerr == nil {
 		t.Fatalf("execution error: done=%v stop=%q err=%v", done, stop, rerr)
+	}
+}
+
+func TestCancelPendingBeforePrompt(t *testing.T) {
+	s := &Session{}
+	s.markCancelPending()
+	if !s.beginTurn(context.Background()) {
+		t.Fatal("cancel that raced the prompt dispatch was lost")
+	}
+	s.endTurn()
+
+	stale := &Session{}
+	stale.cancelPending = true
+	stale.cancelPendingAt = time.Now().Add(-10 * time.Second)
+	if stale.beginTurn(context.Background()) {
+		t.Fatal("stale pending cancel should not affect a later turn")
+	}
+	stale.endTurn()
+}
+
+func TestPromptTextResourceLink(t *testing.T) {
+	got := promptText([]acp.ContentBlock{
+		{Type: "text", Text: "look at this"},
+		{Type: "resource_link", Name: "main.go", URI: "file:///tmp/main.go"},
+	})
+	if !strings.Contains(got, "look at this") || !strings.Contains(got, "Resource: main.go (/tmp/main.go)") {
+		t.Fatalf("promptText = %q", got)
 	}
 }
 
