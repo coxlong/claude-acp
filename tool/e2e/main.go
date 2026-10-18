@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -23,7 +24,11 @@ func main() {
 	listOnly := len(os.Args) > 3 && os.Args[3] == "list"
 	loadMode := len(os.Args) > 3 && os.Args[3] == "load"
 
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	headers := http.Header{}
+	if token := os.Getenv("CLAUDE_ACP_TOKEN"); token != "" {
+		headers.Set("Authorization", "Bearer "+token)
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(url, headers)
 	if err != nil {
 		fatal("dial: %v", err)
 	}
