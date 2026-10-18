@@ -34,7 +34,10 @@ type Config struct {
 	SessionGrace  time.Duration
 	OutboxMax     int
 	MaxFrameBytes int64
-	Log           *slog.Logger
+	// StrictClientID requires reconnects presenting an existing X-Client-Id
+	// to also present the slot secret issued in the connection preamble.
+	StrictClientID bool
+	Log            *slog.Logger
 }
 
 func (c *Config) applyDefaults() {
@@ -145,14 +148,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cid := r.Header.Get("X-Client-Id")
+	secret := r.Header.Get("X-Client-Secret")
+	if cid != "" && s.cfg.StrictClientID {
+		if slot := s.peekSlot(cid); slot != nil && !slot.isClosed() && subtle.ConstantTimeCompare([]byte(secret), []byte(slot.secret)) != 1 {
+			s.log.Warn("rejected client id reattach with wrong secret",
+				"clientId", cid, "remote", r.RemoteAddr)
+			http.Error(w, "unknown client identity", http.StatusForbidden)
+			return
+		}
+	}
+
 	conn, err := s.up.Upgrade(w, r, nil)
 	if err != nil {
 		s.log.Debug("websocket upgrade failed", "err", err)
 		return
 	}
 
-	cid := r.Header.Get("X-Client-Id")
 	slot, reconnect := s.slotFor(cid)
+	if reconnect {
+		// A client id alone is not an identity: log reattaches so hijack
+		// attempts (or client-id collisions) are visible. With
+		// --strict-client-id they are already refused above.
+		s.log.Info("client reattached", "clientId", slot.id, "remote", r.RemoteAddr,
+			"secretOk", secret == slot.secret)
+	}
 	p := slot.attach(conn, reconnect)
 	if p == nil {
 		return
@@ -169,6 +189,16 @@ func (s *Server) authorized(r *http.Request) bool {
 	got := r.Header.Get("Authorization")
 	want := "Bearer " + s.cfg.Token
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// peekSlot returns the live slot for cid without creating one.
+func (s *Server) peekSlot(cid string) *Slot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot := s.slots[cid]; slot != nil && !slot.isClosed() {
+		return slot
+	}
+	return nil
 }
 
 // slotFor returns an existing live slot for cid, or creates a new one.

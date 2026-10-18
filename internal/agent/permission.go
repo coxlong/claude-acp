@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"errors"
+
 	"github.com/coxlong/claude-acp/internal/acp"
 	"github.com/coxlong/claude-acp/internal/claude"
+	"github.com/coxlong/claude-acp/internal/rpc"
 )
 
 // requestPermission bridges a CLI can_use_tool control request to an ACP
@@ -64,6 +67,17 @@ func (a *Agent) requestPermission(sess *Session, req *claude.PermissionRequest) 
 
 	var resp acp.RequestPermissionResponse
 	if err := a.conn.Call(sess.turnContext(), acp.ClientRequestPermission, call, &resp); err != nil {
+		var rerr *rpc.Error
+		if errors.As(err, &rerr) && rerr.Code == -32800 {
+			// The turn was cancelled while the dialog was open. Deny with
+			// interrupt so the CLI stops instead of issuing the next tool
+			// call before the separate interrupt control request lands.
+			return claude.PermissionResult{
+				Behavior:  "deny",
+				Message:   "Tool call cancelled",
+				Interrupt: true,
+			}, nil
+		}
 		return claude.Deny("permission request failed: " + err.Error()), nil
 	}
 

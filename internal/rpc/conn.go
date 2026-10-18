@@ -253,33 +253,56 @@ func (c *Conn) handleIncoming(id json.RawMessage, method string, params json.Raw
 	key := idKey(id)
 	ctx, cancel := context.WithCancelCause(c.ctx)
 	c.mu.Lock()
+	if _, exists := c.inflight[key]; exists {
+		c.mu.Unlock()
+		cancel(nil)
+		// A concurrent duplicate id would silently overwrite the inflight
+		// entry, leaving the first request uncancellable.
+		c.writeResponse(&Response{JSONRPC: Version, ID: id, Error: &Error{
+			Code:    -32600,
+			Message: "request id already in flight",
+		}})
+		return
+	}
 	c.inflight[key] = cancel
 	c.mu.Unlock()
 
 	go func() {
-		defer c.recoverPanic("request " + method)
-		defer func() {
-			c.mu.Lock()
-			delete(c.inflight, key)
-			c.mu.Unlock()
-		}()
-
-		result, rerr := c.handler.Handle(ctx, req)
+		result, rerr := c.invoke(ctx, req)
 		if ctx.Err() != nil {
 			// A $/cancel_request (or connection shutdown) won the race.
 			rerr = ErrCancelled
 		}
 		if rerr != nil {
 			c.writeResponse(&Response{JSONRPC: Version, ID: id, Error: rerr})
-			return
+		} else {
+			raw, err := marshalResult(result)
+			if err != nil {
+				c.writeResponse(&Response{JSONRPC: Version, ID: id, Error: ErrInternalMsg(err.Error())})
+			} else {
+				c.writeResponse(&Response{JSONRPC: Version, ID: id, Result: raw})
+			}
 		}
-		raw, err := marshalResult(result)
-		if err != nil {
-			c.writeResponse(&Response{JSONRPC: Version, ID: id, Error: ErrInternalMsg(err.Error())})
-			return
-		}
-		c.writeResponse(&Response{JSONRPC: Version, ID: id, Result: raw})
+		// Release the request's child context: without this, every completed
+		// request leaks a live context for the connection's lifetime.
+		c.mu.Lock()
+		delete(c.inflight, key)
+		c.mu.Unlock()
+		cancel(nil)
 	}()
+}
+
+// invoke runs the handler with panic recovery so a panicking handler still
+// produces an error response instead of leaving the request unanswered
+// forever.
+func (c *Conn) invoke(ctx context.Context, req *Request) (result any, rerr *Error) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.log.Error("rpc: handler panic", "method", req.Method, "panic", r)
+			result, rerr = nil, ErrInternalMsg("handler panic")
+		}
+	}()
+	return c.handler.Handle(ctx, req)
 }
 
 func (c *Conn) cancelInflight(id json.RawMessage) {

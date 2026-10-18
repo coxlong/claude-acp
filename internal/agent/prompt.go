@@ -12,6 +12,10 @@ import (
 	"github.com/coxlong/claude-acp/internal/rpc"
 )
 
+// turnStallTimeout bounds how long a prompt waits for any CLI output. Without
+// it a wedged CLI (or a silently dropped event) would hold promptMu forever.
+const turnStallTimeout = 10 * time.Minute
+
 // Prompt implements acp.Handler.
 func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptResponse, *rpc.Error) {
 	sess := a.getSession(req.SessionID)
@@ -23,13 +27,21 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 		return acp.PromptResponse{}, rpc.ErrInvalidParams("prompt contains no text")
 	}
 
+	// Register the dispatch so a cancel arriving before the turn starts is
+	// applied to it instead of being silently dropped.
+	a.markDispatch(req.SessionID)
+	defer a.clearDispatch(req.SessionID)
+
 	if !sess.promptMu.TryLock() {
 		return acp.PromptResponse{}, rpc.ErrInvalidParams("session is busy")
 	}
 	defer sess.promptMu.Unlock()
 
 	if sess.beginTurn(ctx) {
-		// A session/cancel raced the prompt dispatch.
+		// A session/cancel raced the prompt dispatch. Release the turn
+		// state beginTurn created, or running stays stuck on the idle
+		// session and the turn context leaks.
+		sess.endTurn()
 		return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 	}
 	defer sess.endTurn()
@@ -39,12 +51,25 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 	}
 
 	turnCtx := sess.turnContext()
+	watchdog := time.NewTimer(turnStallTimeout)
+	defer watchdog.Stop()
 	for {
 		select {
 		case msg, ok := <-sess.client.Events():
 			if !ok {
 				a.dropSession(sess, "process exited during prompt")
 				return acp.PromptResponse{}, rpc.ErrInternalMsg(a.exitError(sess))
+			}
+			if !watchdog.Stop() {
+				select {
+				case <-watchdog.C:
+				default:
+				}
+			}
+			watchdog.Reset(turnStallTimeout)
+			if sess.client.EmitDropped() {
+				a.dropSession(sess, "claude event queue overflow")
+				return acp.PromptResponse{}, rpc.ErrInternalMsg("claude event queue overflow; session terminated")
 			}
 			done, stop, rerr := a.handleEvent(sess, msg)
 			if rerr != nil {
@@ -53,6 +78,9 @@ func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 			if done {
 				return acp.PromptResponse{StopReason: stop}, nil
 			}
+		case <-watchdog.C:
+			a.dropSession(sess, "claude output stalled")
+			return acp.PromptResponse{}, rpc.ErrInternalMsg("claude produced no output for " + turnStallTimeout.String() + "; session terminated")
 		case <-turnCtx.Done():
 			// Either session/cancel cancelled the turn context, or the
 			// JSON-RPC request itself was cancelled ($/cancel_request).
@@ -132,19 +160,26 @@ func (a *Agent) handleStreamEvent(sess *Session, m *claude.StreamEvent) {
 }
 
 func (a *Agent) handleAssistant(sess *Session, m *claude.AssistantMessage) {
+	// The CLI streams each content block's deltas before delivering the
+	// complete assistant message, so the counts observed so far belong to
+	// THIS message. Take (and reset) them here: the fallback is per-message,
+	// not per-turn — otherwise a later message whose deltas were lost would
+	// never be emitted at all.
+	textDeltas, thinkingDeltas := sess.takeDeltaCounts()
+
 	for _, block := range m.Content {
 		switch block.Type {
 		case "text":
 			// With partial streaming enabled, text is emitted from deltas.
-			// Fall back to the complete message if no delta was seen.
-			if block.Text != "" && !sess.sawTextDelta() {
+			// Fall back to the complete message if no delta arrived.
+			if block.Text != "" && textDeltas == 0 {
 				a.notify(sess, acp.SessionUpdate{
 					SessionUpdate: acp.UpdateAgentMessageChunk,
 					Content:       acp.TextContent(block.Text),
 				})
 			}
 		case "thinking":
-			if block.Thinking != "" && !sess.sawThinkingDelta() {
+			if block.Thinking != "" && thinkingDeltas == 0 {
 				a.notify(sess, acp.SessionUpdate{
 					SessionUpdate: acp.UpdateAgentThoughtChunk,
 					Content:       acp.TextContent(block.Thinking),

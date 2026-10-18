@@ -300,3 +300,115 @@ func TestNonLoopbackRequiresToken(t *testing.T) {
 		t.Fatalf("loopback bind should be allowed: %v", err)
 	}
 }
+
+func TestErrorResponsesAreNotCached(t *testing.T) {
+	ts, _ := newTestServer(t, "", 10*time.Second)
+	conn, _ := dial(t, ts, "errcache", nil)
+	_ = readJSON(t, conn)
+
+	req := func(id int) map[string]any {
+		return map[string]any{
+			"jsonrpc": "2.0", "id": id,
+			"method": "session/nonexistent",
+			"params": map[string]any{},
+		}
+	}
+	writeJSON(t, conn, req(1))
+	first := readJSON(t, conn)
+	if first["error"] == nil {
+		t.Fatalf("first = %#v, want error", first)
+	}
+
+	// A retry with the same id must execute again (not be swallowed by the
+	// cached error), returning the same -32601.
+	writeJSON(t, conn, req(1))
+	second := readJSON(t, conn)
+	if second["error"] == nil {
+		t.Fatalf("second = %#v, want error (retry must re-execute)", second)
+	}
+}
+
+func TestMalformedRequestGetsParseError(t *testing.T) {
+	ts, _ := newTestServer(t, "", 10*time.Second)
+	conn, _ := dial(t, ts, "", nil)
+	_ = readJSON(t, conn)
+
+	// Truncated request with a recoverable id.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","id":9,"method":"initialize"`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	resp := readJSON(t, conn)
+	errObj, _ := resp["error"].(map[string]any)
+	if errObj == nil || errObj["code"] != float64(-32700) {
+		t.Fatalf("resp = %#v, want -32700", resp)
+	}
+	if resp["id"] != float64(9) {
+		t.Fatalf("id = %#v, want 9", resp["id"])
+	}
+
+	// The client is still usable.
+	writeJSON(t, conn, map[string]any{
+		"jsonrpc": "2.0", "id": 10, "method": "initialize",
+		"params": map[string]any{"protocolVersion": 1},
+	})
+	if r := readJSON(t, conn); r["result"] == nil {
+		t.Fatalf("after parse error: %#v", r)
+	}
+}
+
+func TestOutboxOverflowKeepsClientAlive(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	agents := make(chan *stubAgent, 2)
+	srv, err := ws.NewServer(ws.Config{
+		Addr:         "127.0.0.1:0",
+		SessionGrace: 10 * time.Second,
+		OutboxMax:    64, // tiny on purpose
+		Log:          logger,
+	}, func(conn *rpc.Conn) rpc.Handler {
+		a := newStub(conn)
+		agents <- a
+		// Storm notifications until the outbox overflows; the slot must
+		// clear its buffer and terminate sessions but stay alive.
+		go func() {
+			big := strings.Repeat("x", 4096)
+			for i := 0; i < 64; i++ {
+				if err := conn.Notify(context.Background(), acp.ClientSessionUpdate, acp.SessionNotification{
+					SessionID: "s1",
+					Update: acp.SessionUpdate{
+						SessionUpdate: acp.UpdateAgentMessageChunk,
+						Content:       acp.TextContent(big),
+					},
+				}); err != nil {
+					return
+				}
+			}
+		}()
+		return acp.NewServer(a)
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer func() { ts.Close(); srv.Shutdown() }()
+
+	conn, _ := dial(t, ts, "overflow", nil)
+	_ = readJSON(t, conn) // preamble
+	time.Sleep(300 * time.Millisecond)
+	_ = conn.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// The slot survived the overflow: reconnect (within grace) reattaches.
+	conn2, _ := dial(t, ts, "overflow", nil)
+	preamble := readJSON(t, conn2)
+	if preamble["type"] != "reconnect" {
+		t.Fatalf("preamble = %#v, want reconnect (slot must survive overflow)", preamble)
+	}
+	writeJSON(t, conn2, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{"protocolVersion": 1},
+	})
+	resp := readJSON(t, conn2)
+	if resp["result"] == nil {
+		t.Fatalf("initialize after overflow = %#v", resp)
+	}
+}

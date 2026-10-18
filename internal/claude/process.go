@@ -2,6 +2,7 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,14 +13,77 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	maxLineBytes = 32 << 20
-	eventBuffer  = 4096
-	stderrLimit  = 64 << 10
+	// maxQueuedEvents bounds the unbounded-style event queue. CLI output per
+	// turn is bounded by the model's output budget, so this is a pathological
+	// case only; hitting it marks the client dropped instead of silently
+	// discarding messages (a dropped ResultMessage would hang the prompt).
+	maxQueuedEvents = 100_000
+	stderrLimit     = 64 << 10
 )
+
+// eventQueue is an unbounded FIFO of CLI messages. Consumers read through a
+// channel fed by a pump goroutine; producers never block and never silently
+// drop. capacity 0 means unbounded (items still capped by maxQueuedEvents via
+// the caller checking EmitDropped).
+type eventQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	items  []Message
+	closed bool
+}
+
+func newEventQueue() *eventQueue {
+	q := &eventQueue{}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *eventQueue) push(m Message) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return false
+	}
+	q.items = append(q.items, m)
+	q.cond.Signal()
+	return true
+}
+
+// pop blocks until a message is available or the queue is closed. ok is false
+// once the queue is closed and drained.
+func (q *eventQueue) pop() (Message, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.items) == 0 && !q.closed {
+		q.cond.Wait()
+	}
+	if len(q.items) == 0 {
+		return nil, false
+	}
+	m := q.items[0]
+	q.items[0] = nil
+	q.items = q.items[1:]
+	return m, true
+}
+
+func (q *eventQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
+func (q *eventQueue) size() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
 
 // Client is a running Claude Code CLI process speaking stream-json.
 type Client struct {
@@ -31,7 +95,9 @@ type Client struct {
 
 	writeMu sync.Mutex
 
-	events    chan Message
+	events    *eventQueue
+	eventCh   chan Message
+	dropped   atomic.Bool
 	done      chan struct{}
 	doneOnce  sync.Once
 	closeOnce sync.Once
@@ -85,10 +151,25 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 		log:     opts.Log,
 		cmd:     cmd,
 		stdin:   stdin,
-		events:  make(chan Message, eventBuffer),
+		events:  newEventQueue(),
+		eventCh: make(chan Message, 256),
 		done:    make(chan struct{}),
 		pending: make(map[string]chan controlResult),
 	}
+
+	// Pump from the unbounded queue into the public channel. The pump blocks
+	// on send when the consumer is slow; the queue absorbs the difference so
+	// no event is ever dropped.
+	go func() {
+		defer close(c.eventCh)
+		for {
+			m, ok := c.events.pop()
+			if !ok {
+				return
+			}
+			c.eventCh <- m
+		}
+	}()
 
 	go c.readLoop(stdout)
 	go c.readStderr(stderr)
@@ -103,7 +184,12 @@ func Start(ctx context.Context, opts Options) (*Client, error) {
 }
 
 // Events yields non-control messages until the process exits.
-func (c *Client) Events() <-chan Message { return c.events }
+func (c *Client) Events() <-chan Message { return c.eventCh }
+
+// EmitDropped reports whether messages were discarded because the event queue
+// exceeded maxQueuedEvents. A prompt that observes it cannot trust the event
+// stream and must terminate the session.
+func (c *Client) EmitDropped() bool { return c.dropped.Load() }
 
 // Done is closed when the client terminates, including an unexpected CLI
 // exit (not only Close).
@@ -124,6 +210,7 @@ func (c *Client) StderrTail() string {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.markDone()
+		c.events.close()
 		_ = c.stdin.Close()
 
 		waited := make(chan struct{})
@@ -144,17 +231,34 @@ func (c *Client) Close() error {
 func (c *Client) readLoop(stdout io.ReadCloser) {
 	defer func() {
 		c.markDone()
-		close(c.events)
+		c.events.close()
 	}()
+
+	// Incremental, size-capped reading. bufio.ReadBytes would accumulate a
+	// newline-less flood without bound (the cap would apply only after the
+	// whole payload was in memory).
 	r := bufio.NewReaderSize(stdout, 1<<20)
+	buf := make([]byte, 64<<10)
+	var acc []byte
 	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > maxLineBytes {
-			c.log.Warn("claude: line exceeds limit", "bytes", len(line))
-			return
-		}
-		if len(line) > 0 {
-			c.handleLine(line)
+		n, err := r.Read(buf)
+		if n > 0 {
+			acc = append(acc, buf[:n]...)
+			for {
+				i := bytes.IndexByte(acc, '\n')
+				if i < 0 {
+					break
+				}
+				line := acc[:i]
+				acc = acc[i+1:]
+				if len(line) > 0 {
+					c.handleLine(line)
+				}
+			}
+			if len(acc) > maxLineBytes {
+				c.log.Warn("claude: line exceeds limit", "bytes", len(acc))
+				return
+			}
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -249,12 +353,13 @@ func (c *Client) handleLine(line []byte) {
 }
 
 func (c *Client) emit(msg Message) {
-	select {
-	case c.events <- msg:
-	case <-c.done:
-	default:
-		c.log.Warn("claude: event buffer full, dropping message")
+	if c.events.size() >= maxQueuedEvents {
+		if !c.dropped.Swap(true) {
+			c.log.Warn("claude: event queue exceeded limit; marking stream untrusted")
+		}
+		return
 	}
+	c.events.push(msg)
 }
 
 func (c *Client) writeJSON(v any) error {

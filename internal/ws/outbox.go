@@ -83,6 +83,15 @@ func (o *outbox) drain() [][]byte {
 	return frames
 }
 
+// clear drops every queued frame. Used by the overflow policy: terminate
+// sessions, clear the buffer, keep the slot alive.
+func (o *outbox) clear() {
+	o.mu.Lock()
+	o.frames = nil
+	o.size = 0
+	o.mu.Unlock()
+}
+
 func (o *outbox) signal() <-chan struct{} { return o.notify }
 
 func (o *outbox) close() {

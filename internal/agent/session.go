@@ -31,10 +31,14 @@ type Session struct {
 	turnCancel      context.CancelFunc
 	cancelPending   bool
 	cancelPendingAt time.Time
-	sawText         bool
-	sawThinking     bool
+	textDeltas      int
+	thinkingDeltas  int
 	toolCalls       map[string]bool
 }
+
+// cancelPendingWindow bounds how long a cancel that raced the prompt dispatch
+// stays armed. It must match dispatchInFlight in agent.go.
+const cancelPendingWindow = 5 * time.Second
 
 func (s *Session) modes() *acp.SessionModeState {
 	s.mu.Lock()
@@ -210,14 +214,14 @@ func (s *Session) beginTurn(ctx context.Context) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.sawText = false
-	s.sawThinking = false
+	s.textDeltas = 0
+	s.thinkingDeltas = 0
 	s.running = true
 	s.turnCtx, s.turnCancel = context.WithCancel(ctx)
 	s.toolCalls = make(map[string]bool)
 	s.cancelled = false
 
-	if s.cancelPending && time.Since(s.cancelPendingAt) <= 5*time.Second {
+	if s.cancelPending && time.Since(s.cancelPendingAt) <= cancelPendingWindow {
 		s.cancelled = true
 	}
 	s.cancelPending = false
@@ -291,26 +295,26 @@ func (s *Session) isAlive() bool {
 
 func (s *Session) markTextDelta() {
 	s.mu.Lock()
-	s.sawText = true
+	s.textDeltas++
 	s.mu.Unlock()
 }
 
 func (s *Session) markThinkingDelta() {
 	s.mu.Lock()
-	s.sawThinking = true
+	s.thinkingDeltas++
 	s.mu.Unlock()
 }
 
-func (s *Session) sawTextDelta() bool {
+// takeDeltaCounts returns and resets the per-message delta counters. The CLI
+// streams each content block's deltas before delivering its complete
+// assistant message, so a zero count means the complete text was never
+// streamed and must be emitted from the full message.
+func (s *Session) takeDeltaCounts() (text int, thinking int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sawText
-}
-
-func (s *Session) sawThinkingDelta() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sawThinking
+	text, thinking = s.textDeltas, s.thinkingDeltas
+	s.textDeltas, s.thinkingDeltas = 0, 0
+	return text, thinking
 }
 
 // noteToolCall records a tool call and reports whether it is new.

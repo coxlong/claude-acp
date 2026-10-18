@@ -35,6 +35,21 @@ func NewServer(handler Handler) *Server {
 	return &Server{handler: handler}
 }
 
+// SessionTerminator is implemented by handlers that can close every session
+// while keeping the connection alive. The WebSocket transport invokes it when
+// the outbound buffer overflows (DESIGN.md 6.6): cancel the work, keep the
+// logical client.
+type SessionTerminator interface {
+	TerminateSessions()
+}
+
+// TerminateSessions forwards to the underlying handler when it supports it.
+func (s *Server) TerminateSessions() {
+	if t, ok := s.handler.(SessionTerminator); ok {
+		t.TerminateSessions()
+	}
+}
+
 // Close releases the underlying handler if it owns resources.
 func (s *Server) Close() error {
 	if closer, ok := s.handler.(io.Closer); ok {

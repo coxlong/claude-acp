@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -195,4 +196,89 @@ func TestMethodNotFound(t *testing.T) {
 		t.Fatalf("err = %v, want -32601", err)
 	}
 	_ = b
+}
+
+func TestDuplicateInFlightIDRejected(t *testing.T) {
+	aToB := make(chan []byte, 8)
+	bToA := make(chan []byte, 8)
+	closed := make(chan struct{})
+	defer close(closed)
+
+	release := make(chan struct{})
+	streamA := &pipe{in: bToA, out: aToB, closed: closed}
+	_ = streamA
+	// Only conn B exists: its readLoop consumes aToB and its responses land
+	// in bToA, which this test reads directly (no competing readLoop).
+	_ = rpc.NewConn(context.Background(), &pipe{in: aToB, out: bToA, closed: closed}, rpc.HandlerFunc(
+		func(ctx context.Context, req *rpc.Request) (any, *rpc.Error) {
+			if req.Method == "slow" {
+				<-release
+			}
+			return map[string]any{"method": req.Method}, nil
+		},
+	))
+
+	sameID := func(method string) map[string]any {
+		return map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": nil}
+	}
+	b, _ := json.Marshal(sameID("slow"))
+	if err := (&pipe{in: bToA, out: aToB, closed: closed}).writeRaw(b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	b2, _ := json.Marshal(sameID("echo"))
+	if err := (&pipe{in: bToA, out: aToB, closed: closed}).writeRaw(b2); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	// The duplicate must get -32600 without waiting for the slow handler.
+	_ = readRaw(bToA, 2*time.Second, t, `"request id already in flight"`)
+	close(release)
+}
+
+func TestHandlerPanicReturnsInternalError(t *testing.T) {
+	aToB := make(chan []byte, 8)
+	bToA := make(chan []byte, 8)
+	closed := make(chan struct{})
+	defer close(closed)
+
+	_ = rpc.NewConn(context.Background(), &pipe{in: aToB, out: bToA, closed: closed}, rpc.HandlerFunc(
+		func(ctx context.Context, req *rpc.Request) (any, *rpc.Error) {
+			panic("boom")
+		},
+	))
+
+	b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 5, "method": "explode", "params": nil})
+	if err := (&pipe{in: bToA, out: aToB, closed: closed}).writeRaw(b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = readRaw(bToA, 2*time.Second, t, `handler panic`)
+}
+
+// writeRaw sends a pre-marshaled frame on the test pipe.
+func (p *pipe) writeRaw(b []byte) error {
+	out := p.out
+	select {
+	case out <- b:
+		return nil
+	case <-p.closed:
+		return io.EOF
+	}
+}
+
+func readRaw(in <-chan []byte, timeout time.Duration, t *testing.T, want string) map[string]any {
+	t.Helper()
+	select {
+	case b := <-in:
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("decode %s: %v", b, err)
+		}
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("frame %s does not contain %q", b, want)
+		}
+		return m
+	case <-time.After(timeout):
+		t.Fatalf("timed out waiting for frame containing %q", want)
+		return nil
+	}
 }

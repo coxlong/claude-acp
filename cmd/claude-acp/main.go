@@ -57,18 +57,20 @@ func runServe(args []string) {
 	tlsCert := fs.String("tls-cert", "", "TLS certificate file")
 	tlsKey := fs.String("tls-key", "", "TLS key file")
 	configDir := fs.String("config-dir", "", "Claude config directory (default ~/.claude)")
+	strictClientID := fs.Bool("strict-client-id", false, "require the slot secret (from the connection preamble) on reconnect with X-Client-Id")
 	_ = fs.Parse(args)
 
 	logger := newLogger(*logLevel)
 
 	server, err := ws.NewServer(ws.Config{
-		Addr:         *addr,
-		Token:        *token,
-		TLSCert:      *tlsCert,
-		TLSKey:       *tlsKey,
-		SessionGrace: *sessionGrace,
-		OutboxMax:    *outboxMax,
-		Log:          logger,
+		Addr:           *addr,
+		Token:          *token,
+		TLSCert:        *tlsCert,
+		TLSKey:         *tlsKey,
+		SessionGrace:   *sessionGrace,
+		OutboxMax:      *outboxMax,
+		StrictClientID: *strictClientID,
+		Log:            logger,
 	}, func(conn *rpc.Conn) rpc.Handler {
 		a := agent.New(conn, agent.Config{
 			ClaudePath:  *claudePath,

@@ -145,7 +145,7 @@ func TestValidateCwdRoot(t *testing.T) {
 
 func TestConcurrentPromptReturnsBusy(t *testing.T) {
 	sess := &Session{id: "s1", mode: "default", toolCalls: map[string]bool{}}
-	a := &Agent{sessions: map[string]*Session{"s1": sess}}
+	a := &Agent{sessions: map[string]*Session{"s1": sess}, dispatching: map[string]time.Time{}}
 	sess.promptMu.Lock()
 	defer sess.promptMu.Unlock()
 

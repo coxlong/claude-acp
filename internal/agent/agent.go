@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -39,11 +40,20 @@ type Agent struct {
 
 	mu       sync.Mutex
 	sessions map[string]*Session
+	reserved int // CLI spawns in flight, counted against MaxSessions
 	closed   bool
 
 	// loadMu serializes session/load so concurrent retries cannot spawn two
 	// CLI processes for the same session id.
 	loadMu sync.Mutex
+
+	// dispatchMu guards the registry of session/prompt requests that have
+	// been dispatched but not yet started a turn. A cancel landing in that
+	// window must be applied to the imminent turn, not swallowed — but a
+	// cancel on a truly idle session must NOT arm a trap that eats the user's
+	// next message.
+	dispatchMu  sync.Mutex
+	dispatching map[string]time.Time
 }
 
 // New creates an agent bound to one logical ACP connection.
@@ -55,10 +65,11 @@ func New(conn *rpc.Conn, cfg Config) *Agent {
 		cfg.Log = slog.Default()
 	}
 	return &Agent{
-		conn:     conn,
-		cfg:      cfg,
-		log:      cfg.Log,
-		sessions: make(map[string]*Session),
+		conn:        conn,
+		cfg:         cfg,
+		log:         cfg.Log,
+		sessions:    make(map[string]*Session),
+		dispatching: make(map[string]time.Time),
 	}
 }
 
@@ -81,6 +92,27 @@ func (a *Agent) Close() error {
 		_ = s.client.Close()
 	}
 	return nil
+}
+
+// TerminateSessions closes every session and its CLI process but keeps the
+// agent (and its ACP connection) alive. The WebSocket layer invokes it when
+// the outbound buffer overflows, per the design's overflow policy.
+func (a *Agent) TerminateSessions() {
+	a.mu.Lock()
+	sessions := make([]*Session, 0, len(a.sessions))
+	for id, s := range a.sessions {
+		sessions = append(sessions, s)
+		delete(a.sessions, id)
+	}
+	a.reserved = 0
+	a.mu.Unlock()
+
+	for _, s := range sessions {
+		_ = s.client.Close()
+	}
+	if len(sessions) > 0 {
+		a.log.Warn("terminated all sessions", "count", len(sessions))
+	}
 }
 
 // Initialize implements acp.Handler.
@@ -108,8 +140,12 @@ func (a *Agent) NewSession(ctx context.Context, req acp.NewSessionRequest) (acp.
 	if errResp := a.validateCwd(req.Cwd); errResp != nil {
 		return acp.NewSessionResponse{}, errResp
 	}
-	if errResp := a.checkCapacity(); errResp != nil {
-		return acp.NewSessionResponse{}, errResp
+	// Additional workspace roots are passed to the CLI as --add-dir; each one
+	// must clear the same boundary as cwd, or the allowlist is decorative.
+	for _, dir := range req.AdditionalDirectories {
+		if errResp := a.validateCwd(dir); errResp != nil {
+			return acp.NewSessionResponse{}, rpc.ErrInvalidParams("additionalDirectories: " + errResp.Message)
+		}
 	}
 
 	id := newUUID()
@@ -148,9 +184,6 @@ func (a *Agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (ac
 		}
 		a.dropSession(existing, "process exited")
 	}
-	if errResp := a.checkCapacity(); errResp != nil {
-		return acp.LoadSessionResponse{}, errResp
-	}
 
 	sess, err := a.startSession(ctx, req.SessionID, req.Cwd, req.SessionID, req.McpServers, nil)
 	if err != nil {
@@ -164,6 +197,18 @@ func (a *Agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (ac
 }
 
 func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, servers []acp.McpServer, additionalDirs []string) (*Session, error) {
+	// Reserve a slot before spawning so concurrent creations cannot exceed
+	// MaxSessions, and so an over-limit request never pays for a CLI launch.
+	if errResp := a.reserveSession(); errResp != nil {
+		return nil, fmt.Errorf("%s", errResp.Message)
+	}
+	inserted := false
+	defer func() {
+		if !inserted {
+			a.releaseReservation()
+		}
+	}()
+
 	sess := &Session{
 		id:        id,
 		cwd:       cwd,
@@ -177,7 +222,6 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 		Resume:         resume,
 		Cwd:            cwd,
 		PermissionMode: sess.mode,
-		McpConfig:      mcpConfigArg(servers),
 		AdditionalDirs: additionalDirs,
 		CliPath:        a.cfg.ClaudePath,
 		Env:            a.cfg.Env,
@@ -188,6 +232,27 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 	}
 	if resume == "" {
 		opts.SessionID = id
+	}
+	// The MCP config may carry secrets (Authorization headers, env values).
+	// Hand it to the CLI via a 0600 temp file instead of argv, where any
+	// local user could read it with ps.
+	if mcpJSON := mcpConfigArg(servers); mcpJSON != "" {
+		tmp, err := os.CreateTemp("", "claude-acp-mcp-*.json")
+		if err != nil {
+			return nil, fmt.Errorf("create mcp config file: %w", err)
+		}
+		mcpPath := tmp.Name()
+		_, writeErr := tmp.WriteString(mcpJSON)
+		closeErr := tmp.Close()
+		if chmodErr := tmp.Chmod(0o600); chmodErr != nil {
+			a.log.Debug("chmod mcp config", "err", chmodErr)
+		}
+		if writeErr != nil || closeErr != nil {
+			_ = os.Remove(mcpPath)
+			return nil, fmt.Errorf("write mcp config file: %v", errors.Join(writeErr, closeErr))
+		}
+		opts.McpConfig = mcpPath
+		defer func() { _ = os.Remove(mcpPath) }()
 	}
 	opts.CanUseTool = func(req *claude.PermissionRequest) (claude.PermissionResult, error) {
 		return a.requestPermission(sess, req)
@@ -201,10 +266,6 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 	sess.models = client.Models()
 	sess.buildConfigOptions()
 
-	if errResp := a.checkCapacity(); errResp != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("%s", errResp.Message)
-	}
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -212,6 +273,8 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 		return nil, fmt.Errorf("agent closed")
 	}
 	a.sessions[id] = sess
+	a.reserved--
+	inserted = true
 	a.mu.Unlock()
 	return sess, nil
 }
@@ -260,16 +323,35 @@ func (a *Agent) CloseSession(_ context.Context, req acp.CloseSessionRequest) (ac
 	return acp.CloseSessionResponse{}, nil
 }
 
+// cancelDispatchWait bounds how long a cancel waits for a concurrently
+// dispatched prompt to register itself. RPC dispatches each request in its
+// own goroutine, so a back-to-back prompt+cancel pair routinely runs the
+// cancel first; without this wait the cancel would be silently dropped and
+// the turn would run to completion.
+const cancelDispatchWait = 500 * time.Millisecond
+
 // Cancel implements acp.Handler.
 func (a *Agent) Cancel(ctx context.Context, req acp.CancelNotification) *rpc.Error {
 	sess := a.getSession(req.SessionID)
 	if sess == nil {
 		return nil
 	}
-	if !sess.isRunning() {
-		// The prompt may have been dispatched but not started yet.
-		sess.markCancelPending()
-		return nil
+	started := time.Now()
+	for {
+		if sess.isRunning() {
+			break
+		}
+		// The prompt may have been dispatched but not started yet: wait a
+		// moment for it to register before deciding this cancel is a no-op
+		// on a truly idle session.
+		if a.dispatchInFlight(req.SessionID) {
+			sess.markCancelPending()
+			return nil
+		}
+		if time.Since(started) > cancelDispatchWait {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	sess.markCancelled()
 	sess.cancelTurn()
@@ -279,6 +361,29 @@ func (a *Agent) Cancel(ctx context.Context, req acp.CancelNotification) *rpc.Err
 		a.log.Debug("interrupt failed", "sessionId", req.SessionID, "err", err)
 	}
 	return nil
+}
+
+// markDispatch records that a session/prompt request has been dispatched but
+// has not yet begun a turn.
+func (a *Agent) markDispatch(sessionID string) {
+	a.dispatchMu.Lock()
+	a.dispatching[sessionID] = time.Now()
+	a.dispatchMu.Unlock()
+}
+
+func (a *Agent) clearDispatch(sessionID string) {
+	a.dispatchMu.Lock()
+	delete(a.dispatching, sessionID)
+	a.dispatchMu.Unlock()
+}
+
+// dispatchInFlight reports whether a prompt was dispatched recently (within
+// the same window markCancelPending uses).
+func (a *Agent) dispatchInFlight(sessionID string) bool {
+	a.dispatchMu.Lock()
+	defer a.dispatchMu.Unlock()
+	started, ok := a.dispatching[sessionID]
+	return ok && time.Since(started) <= cancelPendingWindow
 }
 
 // SetSessionMode implements acp.Handler.
@@ -374,7 +479,10 @@ func (a *Agent) replayIfIdle(sess *Session) bool {
 	return true
 }
 
-func (a *Agent) checkCapacity() *rpc.Error {
+// reserveSession claims a capacity slot before the CLI is spawned. Dead
+// sessions are pruned first so repeated CLI crashes cannot permanently
+// exhaust MaxSessions.
+func (a *Agent) reserveSession() *rpc.Error {
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -387,7 +495,10 @@ func (a *Agent) checkCapacity() *rpc.Error {
 			dead = append(dead, sess)
 		}
 	}
-	over := len(a.sessions) >= a.cfg.MaxSessions
+	over := len(a.sessions)+a.reserved >= a.cfg.MaxSessions
+	if !over {
+		a.reserved++
+	}
 	a.mu.Unlock()
 
 	for _, sess := range dead {
@@ -397,6 +508,14 @@ func (a *Agent) checkCapacity() *rpc.Error {
 		return rpc.ErrInvalidParams("session limit reached")
 	}
 	return nil
+}
+
+func (a *Agent) releaseReservation() {
+	a.mu.Lock()
+	if a.reserved > 0 {
+		a.reserved--
+	}
+	a.mu.Unlock()
 }
 
 func (a *Agent) validateCwd(cwd string) *rpc.Error {
