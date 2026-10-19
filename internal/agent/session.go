@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -45,16 +46,79 @@ func (s *Session) modes() *acp.SessionModeState {
 	defer s.mu.Unlock()
 	return &acp.SessionModeState{
 		CurrentModeID:  s.mode,
-		AvailableModes: availableModes(),
+		AvailableModes: s.availableModesLocked(),
 	}
 }
 
-func availableModes() []acp.SessionMode {
-	return []acp.SessionMode{
-		{ID: "default", Name: "Default", Description: "Ask before acting"},
-		{ID: "acceptEdits", Name: "Accept Edits", Description: "Auto-approve file edits"},
-		{ID: "plan", Name: "Plan", Description: "Plan only, do not execute"},
+// availableModesLocked mirrors claude-agent-acp's buildAvailableModes:
+// "auto" is offered only for models that support it, "bypassPermissions"
+// only when the runtime user allows it, and the rest unconditionally.
+func (s *Session) availableModesLocked() []acp.SessionMode {
+	modes := make([]acp.SessionMode, 0, 6)
+	if info := s.currentModelInfoLocked(); info != nil && info.SupportsAutoMode {
+		modes = append(modes, acp.SessionMode{
+			ID:          "auto",
+			Name:        "Auto",
+			Description: "Use a model classifier to approve/deny permission prompts",
+		})
 	}
+	modes = append(modes,
+		// Claude Code 2.1.200 renamed this mode to "Manual"; the CLI accepts
+		// "manual" directly, so that is the wire id this agent exposes.
+		acp.SessionMode{ID: "manual", Name: "Manual", Description: "Standard behavior, prompts for dangerous operations"},
+		acp.SessionMode{ID: "acceptEdits", Name: "Accept Edits", Description: "Auto-accept file edit operations"},
+		acp.SessionMode{ID: "plan", Name: "Plan Mode", Description: "Planning mode, no actual tool execution"},
+		acp.SessionMode{ID: "dontAsk", Name: "Don't Ask", Description: "Don't prompt for permissions, deny if not pre-approved"},
+	)
+	if allowBypassPermissions() {
+		modes = append(modes, acp.SessionMode{
+			ID:          "bypassPermissions",
+			Name:        "Bypass Permissions",
+			Description: "Bypass all permission checks",
+		})
+	}
+	return modes
+}
+
+// currentModelInfoLocked returns the model entry the session is currently
+// using, or nil when the CLI reported no matching model.
+func (s *Session) currentModelInfoLocked() *claude.ModelInfo {
+	model := s.model
+	if model == "" && len(s.models) > 0 {
+		model = s.models[0].Name()
+	}
+	for i := range s.models {
+		if s.models[i].Name() == model {
+			return &s.models[i]
+		}
+	}
+	return nil
+}
+
+// hasMode reports whether the mode is advertised for this session right now.
+func (s *Session) hasMode(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return hasModeID(s.availableModesLocked(), id)
+}
+
+func hasModeID(modes []acp.SessionMode, id string) bool {
+	for _, m := range modes {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// allowBypassPermissions mirrors claude-agent-acp's ALLOW_BYPASS: bypass is
+// unsafe as root, so it is only offered there inside a sandbox.
+func allowBypassPermissions() bool {
+	return bypassAllowed(os.Geteuid(), os.Getenv("IS_SANDBOX") != "")
+}
+
+func bypassAllowed(euid int, sandbox bool) bool {
+	return euid != 0 || sandbox
 }
 
 func (s *Session) snapshotConfigOptions() []acp.SessionConfigOption {
@@ -74,14 +138,16 @@ func (s *Session) buildConfigOptions() {
 func (s *Session) buildConfigOptionsLocked() {
 	options := make([]acp.SessionConfigOption, 0, 3)
 
-	modes := availableModes()
+	modes := s.availableModesLocked()
 	modeOptions := make([]acp.SessionConfigSelectOption, 0, len(modes))
 	for _, m := range modes {
 		modeOptions = append(modeOptions, acp.SessionConfigSelectOption{Value: m.ID, Name: m.Name, Description: m.Description})
 	}
 	currentMode := s.mode
-	if currentMode == "" {
-		currentMode = "default"
+	if currentMode == "" || !hasModeID(modes, currentMode) {
+		// The mode may have become unavailable because of a model switch
+		// (e.g. "auto" on a model without classifier support).
+		currentMode = "manual"
 	}
 	s.mode = currentMode
 	options = append(options, acp.SessionConfigOption{
@@ -181,11 +247,20 @@ func (s *Session) setMode(mode string) {
 	s.mu.Unlock()
 }
 
-func (s *Session) setModel(model string) {
+// setModel switches the model and rebuilds model-dependent options. It
+// returns the mode ACP had to clamp to when the new model no longer offers
+// the current one, so the caller can sync the CLI's permission mode; the
+// result is empty when the mode is unchanged.
+func (s *Session) setModel(model string) string {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.mode
 	s.model = model
 	s.buildConfigOptionsLocked()
-	s.mu.Unlock()
+	if s.mode != previous {
+		return s.mode
+	}
+	return ""
 }
 
 func (s *Session) setEffort(effort string) {

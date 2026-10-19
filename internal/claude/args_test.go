@@ -24,6 +24,16 @@ func TestBuildArgs(t *testing.T) {
 	}
 }
 
+func TestBuildArgsAllowBypass(t *testing.T) {
+	args := BuildArgs(Options{PermissionMode: "manual", AllowBypass: true})
+	if !slices.Contains(args, "--allow-dangerously-skip-permissions") {
+		t.Fatalf("missing bypass enabler: %v", args)
+	}
+	if slices.Contains(args, "--dangerously-skip-permissions") {
+		t.Fatalf("bypass enabler must not force the mode: %v", args)
+	}
+}
+
 func TestBuildArgsResume(t *testing.T) {
 	args := BuildArgs(Options{Resume: "old"})
 	if !slices.Contains(args, "--resume=old") {
@@ -57,5 +67,13 @@ func TestOptionsValidate(t *testing.T) {
 	}
 	if err := (Options{SessionID: "a", PermissionMode: "plan"}).Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, mode := range []string{"auto", "dontAsk", "manual"} {
+		if err := (Options{PermissionMode: mode}).Validate(); err != nil {
+			t.Fatalf("mode %q rejected: %v", mode, err)
+		}
+	}
+	if err := (Options{PermissionMode: "default"}).Validate(); err == nil {
+		t.Fatal(`"default" is no longer the wire id; "manual" is`)
 	}
 }

@@ -563,7 +563,12 @@ agent:
 
 - 模型列表：来自 `initialize` 控制请求响应的 `models` 字段；
 - effort 档位：来自同一响应或 `supportedEffortLevels`；
-- 模式：`default`、`acceptEdits`、`plan`、`bypassPermissions`（root 下不提供 bypass）。
+- 模式（与 `claude-agent-acp` 的 `buildAvailableModes` 对齐）：
+  - `auto`（名称 Auto）——仅当当前模型 `supportsAutoMode: true` 时提供；
+  - `manual`（名称 **Manual**）——CLI 的标准权限模式；不再使用旧名 `default`；
+  - `acceptEdits`、`plan`、`dontAsk`——始终提供；
+  - `bypassPermissions`——仅当 `!root || IS_SANDBOX` 时提供；此时 CLI 以 `--allow-dangerously-skip-permissions` 启动。
+  - 切换模型后重新计算模式列表；当前模式不再可用时钳制回 `manual` 并同步给 CLI。
 
 转换为 ACP `configOptions`（与 npm adapter 的 id 保持一致）：
 

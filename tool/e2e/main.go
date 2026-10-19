@@ -30,6 +30,7 @@ func main() {
 	loadMode := mode == "load"
 	cancelMode := mode == "cancel"
 	cancelRace := mode == "cancel-race"
+	modesMode := mode == "modes"
 
 	headers := http.Header{}
 	if token := os.Getenv("CLAUDE_ACP_TOKEN"); token != "" {
@@ -113,9 +114,24 @@ func main() {
 		fatal("no sessionId in %v", sessResp)
 	}
 	fmt.Printf("session/new -> %s\n", sid)
+	if modes, ok := result["modes"]; ok {
+		b, _ := json.Marshal(modes)
+		fmt.Printf("modes -> %s\n", b)
+	}
 	if opts, ok := result["configOptions"]; ok {
 		b, _ := json.Marshal(opts)
 		fmt.Printf("configOptions -> %s\n", b)
+	}
+
+	if modesMode {
+		for _, id := range []string{"auto", "dontAsk", "plan", "acceptEdits", "manual", "bypassPermissions"} {
+			resp := call("session/set_mode", message{"sessionId": sid, "modeId": id})
+			fmt.Printf("set_mode %s -> %v\n", id, resp["result"])
+		}
+		resp := call("session/set_config_option", message{"sessionId": sid, "configId": "mode", "value": "dontAsk"})
+		fmt.Printf("set_config_option mode=dontAsk -> %v\n", resp["result"])
+		_ = call("session/close", message{"sessionId": sid})
+		return
 	}
 
 	if cancelMode || cancelRace {

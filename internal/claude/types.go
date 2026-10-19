@@ -128,6 +128,7 @@ type ModelInfo struct {
 	Description           string   `json:"description"`
 	SupportsEffort        bool     `json:"supportsEffort"`
 	SupportedEffortLevels []string `json:"supportedEffortLevels"`
+	SupportsAutoMode      bool     `json:"supportsAutoMode"`
 	ResolvedModel         string   `json:"resolvedModel"`
 }
 

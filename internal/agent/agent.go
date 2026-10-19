@@ -213,7 +213,7 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 		id:        id,
 		cwd:       cwd,
 		agent:     a,
-		mode:      "default",
+		mode:      "manual",
 		toolCalls: make(map[string]bool),
 	}
 
@@ -222,6 +222,7 @@ func (a *Agent) startSession(ctx context.Context, id, cwd, resume string, server
 		Resume:         resume,
 		Cwd:            cwd,
 		PermissionMode: sess.mode,
+		AllowBypass:    allowBypassPermissions(),
 		AdditionalDirs: additionalDirs,
 		CliPath:        a.cfg.ClaudePath,
 		Env:            a.cfg.Env,
@@ -392,8 +393,8 @@ func (a *Agent) SetSessionMode(ctx context.Context, req acp.SetSessionModeReques
 	if sess == nil {
 		return acp.SetSessionModeResponse{}, rpc.ErrInvalidParams("unknown session: " + req.SessionID)
 	}
-	if !validMode(req.ModeID) {
-		return acp.SetSessionModeResponse{}, rpc.ErrInvalidParams("unknown mode: " + req.ModeID)
+	if !sess.hasMode(req.ModeID) {
+		return acp.SetSessionModeResponse{}, rpc.ErrInvalidParams("mode is not available in this session: " + req.ModeID)
 	}
 	if err := sess.client.SetPermissionMode(ctx, req.ModeID); err != nil {
 		return acp.SetSessionModeResponse{}, rpc.ErrInternalMsg(err.Error())
@@ -414,8 +415,8 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, req acp.SetSessionCo
 
 	switch req.ConfigID {
 	case "mode":
-		if !validMode(value) {
-			return acp.SetSessionConfigOptionResponse{}, rpc.ErrInvalidParams("unknown mode: " + value)
+		if !sess.hasMode(value) {
+			return acp.SetSessionConfigOptionResponse{}, rpc.ErrInvalidParams("mode is not available in this session: " + value)
 		}
 		if err := sess.client.SetPermissionMode(ctx, value); err != nil {
 			return acp.SetSessionConfigOptionResponse{}, rpc.ErrInternalMsg(err.Error())
@@ -430,7 +431,15 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, req acp.SetSessionCo
 		if err := sess.client.SetModel(ctx, value); err != nil {
 			return acp.SetSessionConfigOptionResponse{}, rpc.ErrInternalMsg(err.Error())
 		}
-		sess.setModel(value)
+		// Switching models can remove "auto" from the mode list. Mirror
+		// claude-agent-acp: clamp the session to the nearest valid mode and
+		// sync the CLI, but do not fail the model switch if that fails.
+		if clamped := sess.setModel(value); clamped != "" {
+			if err := sess.client.SetPermissionMode(ctx, clamped); err != nil {
+				a.log.Warn("failed to sync clamped permission mode", "sessionId", sess.id, "mode", clamped, "err", err)
+			}
+			a.notify(sess, acp.SessionUpdate{SessionUpdate: acp.UpdateCurrentMode, CurrentModeID: clamped})
+		}
 
 	case "effort":
 		if value == "" {
@@ -554,14 +563,6 @@ func (a *Agent) notify(sess *Session, update acp.SessionUpdate) {
 	if err != nil {
 		a.log.Debug("session/update failed", "sessionId", sess.id, "err", err)
 	}
-}
-
-func validMode(mode string) bool {
-	switch mode {
-	case "default", "acceptEdits", "plan", "bypassPermissions":
-		return true
-	}
-	return false
 }
 
 func mcpConfigArg(servers []acp.McpServer) string {

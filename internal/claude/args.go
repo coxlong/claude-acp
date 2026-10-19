@@ -13,6 +13,9 @@ type Options struct {
 	Cwd            string
 	Model          string
 	PermissionMode string
+	// AllowBypass makes bypassPermissions switchable at runtime without
+	// starting the session in that mode.
+	AllowBypass    bool
 	Effort         string
 	McpConfig      string
 	AdditionalDirs []string
@@ -46,6 +49,9 @@ func BuildArgs(o Options) []string {
 	if o.PermissionMode != "" {
 		args = append(args, "--permission-mode", o.PermissionMode)
 	}
+	if o.AllowBypass {
+		args = append(args, "--allow-dangerously-skip-permissions")
+	}
 	if o.Effort != "" {
 		args = append(args, "--effort", o.Effort)
 	}
@@ -78,7 +84,7 @@ func (o Options) Validate() error {
 
 func validPermissionMode(mode string) bool {
 	switch mode {
-	case "default", "acceptEdits", "plan", "bypassPermissions":
+	case "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions":
 		return true
 	}
 	return false
